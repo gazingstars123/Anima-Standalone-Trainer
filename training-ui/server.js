@@ -262,6 +262,25 @@ function broadcastLog(jobName, message) {
     }
 }
 
+function getTrainingFailureHints(exitCode, logBuffer) {
+    if (exitCode === 0) return [];
+
+    const joinedLogs = logBuffer.join('');
+    const hints = [];
+
+    // On Windows, accelerate can exit with code 1 while reporting a child process crash
+    // with NTSTATUS 3221225477 (0xC0000005, access violation).
+    if (joinedLogs.includes('3221225477') || joinedLogs.includes('0xC0000005')) {
+        hints.push(
+            'Detected Windows access violation (3221225477 / 0xC0000005) from a child training process.',
+            'Common causes: unstable overclock/driver state, aggressive worker/pinned-memory settings, CUDA/xFormers mismatch, or mixed-precision kernel instability.',
+            'Suggested checks: update/reinstall GPU driver, reduce dataloader workers, disable xFormers/FlashAttention options, and retry with safer precision settings.'
+        );
+    }
+
+    return hints;
+}
+
 function broadcastStatus(jobName, status) {
     const clients = wsClients.get(jobName);
     if (clients) {
@@ -1225,6 +1244,13 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         logStream.on('error', (err) => console.error(`[Train/LogFile] ${err.message}`));
 
         proc.on('close', (code) => {
+            const hints = getTrainingFailureHints(code, logBuffer);
+            if (hints.length) {
+                const hintBlock = `\n--- Crash diagnostics ---\n${hints.map(h => `- ${h}`).join('\n')}\n`;
+                logStream.write(hintBlock);
+                appendLog(Buffer.from(hintBlock));
+            }
+
             const msg = `\n--- Training ${code === 0 ? 'completed' : 'stopped'} (exit code: ${code}) ---\n`;
             logStream.write(msg);
             logStream.end();
