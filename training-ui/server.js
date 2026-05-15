@@ -373,6 +373,12 @@ function buildTrainingConfig(jobName, jobPath) {
         logging_dir: loggingDir,
         save_state: true
     };
+    // save_last_n_steps_state is in steps, but the UI field means "N checkpoints".
+    // Convert: multiply by save_every_n_steps so Python keeps the last N checkpoints.
+    if (merged.training_arguments.save_last_n_steps_state && merged.training_arguments.save_every_n_steps) {
+        merged.training_arguments.save_last_n_steps_state =
+            merged.training_arguments.save_last_n_steps_state * merged.training_arguments.save_every_n_steps;
+    }
 
     // Move resume from network_args to training_args
     if (jobConfig.network_arguments?.resume) {
