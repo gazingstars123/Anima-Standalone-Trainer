@@ -377,7 +377,7 @@ function buildTrainingConfig(jobName, jobPath) {
     // Convert: multiply by save_every_n_steps so Python keeps the last N checkpoints.
     if (merged.training_arguments.save_last_n_steps_state && merged.training_arguments.save_every_n_steps) {
         merged.training_arguments.save_last_n_steps_state =
-            merged.training_arguments.save_last_n_steps_state * merged.training_arguments.save_every_n_steps;
+            merged.training_arguments.save_last_n_steps_state * merged.training_arguments.save_every_n_steps - 1;
     }
 
     // Move resume from network_args to training_args
