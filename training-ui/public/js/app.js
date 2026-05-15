@@ -649,7 +649,7 @@ function gatherConfig() {
         ? safeInt($("cfg-save-every").value)
         : undefined,
       save_last_n_epochs_state: isEpochs
-        ? safeInt($("cfg-keep-last-n-states-epochs").value)
+        ? safeInt($("cfg-keep-last-n-states-epochs").value, 1)
         : undefined,
       sample_every_n_epochs:
         isEpochs && enableSampling
@@ -662,7 +662,7 @@ function gatherConfig() {
         ? safeInt($("cfg-save-every-steps").value)
         : undefined,
       save_last_n_steps_state: !isEpochs
-        ? safeInt($("cfg-keep-last-n-states-steps").value)
+        ? safeInt($("cfg-keep-last-n-states-steps").value, 1)
         : undefined,
       sample_every_n_steps:
         !isEpochs && enableSampling
