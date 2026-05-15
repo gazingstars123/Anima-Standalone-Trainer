@@ -371,9 +371,7 @@ function buildTrainingConfig(jobName, jobPath) {
         ...trainingArgs,
         output_dir: outputDir,
         logging_dir: loggingDir,
-        save_state: true,
-        save_last_n_steps_state: 1,
-        save_last_n_epochs_state: 1
+        save_state: true
     };
 
     // Move resume from network_args to training_args
