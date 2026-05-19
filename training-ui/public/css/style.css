@@ -220,6 +220,11 @@ body {
     animation: pulse 1.5s infinite;
 }
 
+.job-item.queued .status-dot {
+    background: var(--warning);
+    animation: pulse 2s infinite;
+}
+
 @keyframes pulse {
 
     0%,
@@ -667,6 +672,15 @@ body {
     background: var(--bg-tertiary);
     color: var(--text-primary);
     border-color: var(--text-secondary);
+}
+
+.btn-warning {
+    background: var(--warning);
+    color: #000;
+}
+
+.btn-warning:hover {
+    filter: brightness(1.1);
 }
 
 .btn-sm {
