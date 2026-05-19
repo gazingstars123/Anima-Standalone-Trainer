@@ -497,10 +497,11 @@ wss.on('connection', (ws) => {
 
                 // Send current status
                 const isRunning = runningJobs.has(msg.job);
+                const isQueued = trainingQueue.includes(msg.job);
                 ws.send(JSON.stringify({
                     job: msg.job,
                     type: 'status',
-                    data: isRunning ? 'running' : 'idle'
+                    data: isRunning ? 'running' : (isQueued ? 'queued' : 'idle')
                 }));
 
                 // Send buffered logs
