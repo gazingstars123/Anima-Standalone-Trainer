@@ -496,12 +496,17 @@ wss.on('connection', (ws) => {
                 wsClients.get(msg.job).add(ws);
 
                 // Send current status
-                const isRunning = runningJobs.has(msg.job);
-                const isQueued = trainingQueue.includes(msg.job);
+                const jobType = runningJobs.get(msg.job)?.type;
+                const status =
+                    jobType === 'generation' ? 'generating' :
+                    jobType === 'training' ? 'running' :
+                    trainingQueue.includes(msg.job) ? 'queued' :
+                    'idle';
+
                 ws.send(JSON.stringify({
                     job: msg.job,
                     type: 'status',
-                    data: isRunning ? 'running' : (isQueued ? 'queued' : 'idle')
+                    data: status
                 }));
 
                 // Send buffered logs
@@ -716,10 +721,19 @@ app.put('/api/jobs/:name', (req, res) => {
 // Delete job
 app.delete('/api/jobs/:name', (req, res) => {
     try {
-        const jobPath = getJobPath(req.params.name);
-        if (runningJobs.has(req.params.name)) {
+        const jobName = sanitizeName(req.params.name);
+        const jobPath = getJobPath(jobName);
+        if (runningJobs.has(jobName)) {
             return res.status(400).json({ error: 'Stop job before deleting' });
         }
+
+        // Remove from queue if it is waiting
+        const queueIndex = trainingQueue.indexOf(jobName);
+        if (queueIndex > -1) {
+            trainingQueue.splice(queueIndex, 1);
+            saveQueue();
+        }
+
         if (fs.existsSync(jobPath)) {
             fs.rmSync(jobPath, { recursive: true });
         }
@@ -1216,8 +1230,8 @@ app.get('/api/jobs/:name/checkpoints', (req, res) => {
 app.post('/api/jobs/:name/generate', async (req, res) => {
     try {
         const jobName = sanitizeName(req.params.name);
-        if (runningJobs.has(jobName)) {
-            return res.status(400).json({ error: 'Job is running. Stop it first.' });
+        if (runningJobs.has(jobName) || trainingQueue.includes(jobName)) {
+            return res.status(400).json({ error: 'Job is running or queued. Stop it first.' });
         }
 
         const jobPath = getJobPath(jobName);
@@ -1706,8 +1720,8 @@ function processTrainingQueue() {
 app.get('/api/jobs/:name/train/status', (req, res) => {
     try {
         const jobName = sanitizeName(req.params.name);
-        const isRunning = runningJobs.has(jobName);
-        res.json({ running: isRunning });
+        const job = runningJobs.get(jobName);
+        res.json({ running: job ? job.type === 'training' : false });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
