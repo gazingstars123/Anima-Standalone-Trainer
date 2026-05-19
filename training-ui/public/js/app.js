@@ -84,7 +84,7 @@ function connectWS() {
         appendConsole(msg.data);
       } else if (msg.type === "status") {
         if (msg.data === "generating") return; // Ignore generation status for Training button
-        updateRunningState(msg.data === "running");
+        updateJobStatus(msg.data);
       }
     } catch (e) { }
   };
@@ -286,7 +286,15 @@ async function selectJob(name) {
     await loadPrompts();
     // Check run status
     const status = await api(`/api/jobs/${name}/train/status`);
-    updateRunningState(status.running);
+    const queue = await api("/api/train/queue");
+    const isQueued = queue.includes(name);
+    if (status.running) {
+    updateJobStatus("running");
+    } else if (isQueued) {
+        updateJobStatus("queued");
+    } else {
+        updateJobStatus("idle");
+    }
     // Set default negative prompt if no saved value exists for this job
     const savedTransient = localStorage.getItem(`prompt_transient_${name}`);
     if (!savedTransient || !JSON.parse(savedTransient).negative_prompt) {
@@ -319,14 +327,46 @@ async function selectJob(name) {
     emptyState.classList.remove("hidden");
   }
 }
-function updateRunningState(running) {
-  $("btn-run").classList.toggle("hidden", running);
-  $("btn-stop").classList.toggle("hidden", !running);
-  // Update sidebar dot
+
+// ==========================================
+// Form Locking
+// ==========================================
+// Form inputs deliberately remain unlocked and editable even when a job is 
+// queued or actively running. This lets the user adjust training arguments, 
+// dataset properties, or prompt arrays up until the precise second that 
+// the background worker pops the job from the queue and invokes the process.
+
+function updateJobStatus(status) {
+  const runBtn = $("btn-run");
+  const stopBtn = $("btn-stop");
+
+  if (status === "running") {
+    runBtn.classList.add("hidden");
+    stopBtn.classList.remove("hidden");
+    stopBtn.textContent = "⏹ Stop Training";
+    stopBtn.className = "btn btn-danger";
+  } else if (status === "queued") {
+    runBtn.classList.add("hidden");
+    stopBtn.classList.remove("hidden");
+    stopBtn.textContent = "⏹ Cancel Queue";
+    stopBtn.className = "btn btn-warning";
+  } else { // idle, dequeued, stopping, etc.
+    runBtn.classList.remove("hidden");
+    runBtn.textContent = "▶ Train";
+    runBtn.className = "btn btn-success";
+    stopBtn.classList.add("hidden");
+  }
+
+  // Sync sidebar indicators across all states
   document.querySelectorAll(".job-item").forEach((el) => {
     const name = el.querySelector(".job-name").textContent;
     if (name === currentJob) {
-      el.classList.toggle("running", running);
+      el.classList.remove("running", "queued");
+      if (status === "running") {
+        el.classList.add("running");
+      } else if (status === "queued") {
+        el.classList.add("queued");
+      }
     }
   });
 }
@@ -3093,7 +3133,7 @@ $("btn-run").addEventListener("click", async () => {
     alert(result.error);
     return;
   }
-  updateRunningState(true);
+  updateJobStatus("queued");
   consoleOutput.textContent = "";
   if (warningMsg) appendConsole(warningMsg);
   // Auto-switch to console tab
@@ -3157,13 +3197,18 @@ $("btn-refresh-checkpoints").addEventListener("click", () => {
 // Stop
 $("btn-stop").addEventListener("click", () => {
   if (!currentJob) return;
+  const stopBtnText = $("btn-stop").textContent;
+  const isCancelQueue = stopBtnText.includes("Cancel Queue");
+  const title = isCancelQueue ? "Cancel Queue" : "Stop Training";
+  const message = isCancelQueue ? `Remove "${currentJob}" from the training queue?` : `Stop training for "${currentJob}"?`;
+
   showConfirm(
-    "Stop Training",
-    `Stop training for "${currentJob}"?`,
+    title,
+    message,
     async () => {
       await api(`/api/jobs/${currentJob}/train/stop`, { method: "POST" });
-      updateRunningState(false);
-      showToast("Training stopped");
+      updateJobStatus("idle");
+      showToast(isCancelQueue ? "Job removed from queue" : "Training stopped");
     },
   );
 });
