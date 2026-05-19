@@ -2584,6 +2584,7 @@ async function loadQueueUI() {
 
 async function removeFromQueue(jobName) {
     showConfirm("Remove from Queue", `Remove "${jobName}" from the training queue?`, async () => {
+      try {
         await api(`/api/jobs/${jobName}/train/stop`, { method: "POST" });
         await loadQueueUI();
 
@@ -2595,12 +2596,17 @@ async function removeFromQueue(jobName) {
             updateJobStatus(jobName, "idle");
         }
         showToast("Job removed from queue");
+      } catch (err) {
++      showToast(`Failed to remove from queue: ${err.message}`);
+      }
     });
 }
 
 // Queue Toggle Binding
 $("btn-toggle-queue").addEventListener("click", () => {
-    $("queue-panel").classList.toggle("hidden");
+    const panel = $("queue-panel");
+    const isHidden = panel.classList.toggle("hidden");
+    $("btn-toggle-queue").setAttribute("aria-expanded", String(!isHidden));
 });
 
 // ==========================================
@@ -3289,9 +3295,13 @@ $("btn-stop").addEventListener("click", () => {
     title,
     message,
     async () => {
-      await api(`/api/jobs/${currentJob}/train/stop`, { method: "POST" });
-      updateJobStatus(currentJob, "idle");
-      showToast(isCancelQueue ? "Job removed from queue" : "Training stopped");
+      try {
+        await api(`/api/jobs/${currentJob}/train/stop`, { method: "POST" });
+        updateJobStatus(currentJob, "idle");
+        showToast(isCancelQueue ? "Job removed from queue" : "Training stopped");
+      } catch (err) {
+        showToast(`Failed to update training state: ${err.message}`);
+      }
     },
   );
 });

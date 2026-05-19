@@ -1519,192 +1519,199 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
 });
 
 function executeTraining(jobName) {
-    const jobPath = getJobPath(jobName);
-    const configPath = path.join(jobPath, 'config.toml');
-    // Auto-kill persistent gen server to free VRAM
-    if (persistentGenProcess) {
-        console.log("Stopping persistent generation server before training...");
-        killPersistentGen();
-    }
-
-    // Build merged config and write to temp file
-    const mergedConfig = buildTrainingConfig(jobName, jobPath);
-
-    // TP/SP: strip options that are incompatible with the TP training script.
-    const launchMode = mergedConfig.training_arguments?.multigpu_mode
-        || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
-    if (launchMode === 'tp_sp' && mergedConfig.training_arguments) {
-        mergedConfig.training_arguments.sequence_parallel = true;
-        // Normalize tp_degree with NaN guard
-        let tp = Number(mergedConfig.training_arguments.tp_degree || 2);
-        if (!Number.isFinite(tp)) tp = 2;
-        mergedConfig.training_arguments.tp_degree = Math.max(2, tp);
-        // Validate tp_backend against whitelist
-        const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
-        const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'gloo' : 'nccl');
-        mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
-        delete mergedConfig.training_arguments.use_cuda_direct;
-        delete mergedConfig.training_arguments.save_state;
-        delete mergedConfig.training_arguments.save_state_on_train_end;
-        delete mergedConfig.training_arguments.save_last_n_steps_state;
-        delete mergedConfig.training_arguments.save_last_n_epochs_state;
-    } else if (mergedConfig.training_arguments) {
-        delete mergedConfig.training_arguments.no_fuse_qkv;
-        delete mergedConfig.training_arguments.tp_backend;
-        delete mergedConfig.training_arguments.tp_degree;
-        delete mergedConfig.training_arguments.sequence_parallel;
-    }
-
-    if (mergedConfig.training_arguments && launchMode !== 'deepspeed') {
-        delete mergedConfig.training_arguments.deepspeed;
-        delete mergedConfig.training_arguments.zero_stage;
-        delete mergedConfig.training_arguments.offload_optimizer_device;
-        delete mergedConfig.training_arguments.offload_optimizer_nvme_path;
-        delete mergedConfig.training_arguments.offload_param_device;
-        delete mergedConfig.training_arguments.offload_param_nvme_path;
-        delete mergedConfig.training_arguments.zero3_init_flag;
-        delete mergedConfig.training_arguments.zero3_save_16bit_model;
-        delete mergedConfig.training_arguments.fp16_master_weights_and_gradients;
-    } else if (mergedConfig.training_arguments) {
-        mergedConfig.training_arguments.deepspeed = true;
-    }
-
-    // Convert Windows paths to WSL paths when running under WSL
-    if (isWSL) {
-        // Convert all paths in merged config (model paths, output dirs, etc.)
-        const converted = convertPathsInObject(mergedConfig);
-        // Also convert image_dir entries inside dataset.toml -> write a WSL version
-        const datasetPath = path.join(jobPath, 'dataset.toml');
-        if (fs.existsSync(datasetPath)) {
-            const datasetRaw = TOML.parse(fs.readFileSync(datasetPath, 'utf8'));
-            const datasetConverted = convertPathsInObject(datasetRaw);
-            const mergedDatasetPath = path.join(jobPath, '_merged_dataset.toml');
-            fs.writeFileSync(mergedDatasetPath, TOML.stringify(datasetConverted), 'utf8');
-            if (converted.dataset_arguments) {
-                converted.dataset_arguments.dataset_config = mergedDatasetPath;
-            }
-        }
-        Object.assign(mergedConfig, converted);
-    }
-
-    const mergedConfigPath = path.join(jobPath, '_merged_config.toml');
-    fs.writeFileSync(mergedConfigPath, TOML.stringify(mergedConfig), 'utf8');
-
-    // Ensure output dirs exist
-    const outputDir = path.join(jobPath, 'output');
-    const logsDir = path.join(jobPath, 'logs');
-    if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
-
-    // Get venv path from global config
-    const globalConfig = getGlobalConfig();
-    const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
-    const venv = getVenvPaths(venvPath);
-
-    const jobArch = getArchForJob(mergedConfig);
-    const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
-
-    let currentGpuIds = '';
     try {
-        const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
-        currentGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
+        const jobPath = getJobPath(jobName);
+        const configPath = path.join(jobPath, 'config.toml');
+        // Auto-kill persistent gen server to free VRAM
+        if (persistentGenProcess) {
+            console.log("Stopping persistent generation server before training...");
+            killPersistentGen();
+        }
+
+        // Build merged config and write to temp file
+        const mergedConfig = buildTrainingConfig(jobName, jobPath);
+
+        // TP/SP: strip options that are incompatible with the TP training script.
+        const launchMode = mergedConfig.training_arguments?.multigpu_mode
+            || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
+        if (launchMode === 'tp_sp' && mergedConfig.training_arguments) {
+            mergedConfig.training_arguments.sequence_parallel = true;
+            // Normalize tp_degree with NaN guard
+            let tp = Number(mergedConfig.training_arguments.tp_degree || 2);
+            if (!Number.isFinite(tp)) tp = 2;
+            mergedConfig.training_arguments.tp_degree = Math.max(2, tp);
+            // Validate tp_backend against whitelist
+            const allowedBackends = ['nccl', 'cuda_direct', 'gloo', 'mpi'];
+            const rawBackend = mergedConfig.training_arguments.tp_backend || (isWindows ? 'gloo' : 'nccl');
+            mergedConfig.training_arguments.tp_backend = allowedBackends.includes(rawBackend) ? rawBackend : (isWindows ? 'gloo' : 'nccl');
+            delete mergedConfig.training_arguments.use_cuda_direct;
+            delete mergedConfig.training_arguments.save_state;
+            delete mergedConfig.training_arguments.save_state_on_train_end;
+            delete mergedConfig.training_arguments.save_last_n_steps_state;
+            delete mergedConfig.training_arguments.save_last_n_epochs_state;
+        } else if (mergedConfig.training_arguments) {
+            delete mergedConfig.training_arguments.no_fuse_qkv;
+            delete mergedConfig.training_arguments.tp_backend;
+            delete mergedConfig.training_arguments.tp_degree;
+            delete mergedConfig.training_arguments.sequence_parallel;
+        }
+
+        if (mergedConfig.training_arguments && launchMode !== 'deepspeed') {
+            delete mergedConfig.training_arguments.deepspeed;
+            delete mergedConfig.training_arguments.zero_stage;
+            delete mergedConfig.training_arguments.offload_optimizer_device;
+            delete mergedConfig.training_arguments.offload_optimizer_nvme_path;
+            delete mergedConfig.training_arguments.offload_param_device;
+            delete mergedConfig.training_arguments.offload_param_nvme_path;
+            delete mergedConfig.training_arguments.zero3_init_flag;
+            delete mergedConfig.training_arguments.zero3_save_16bit_model;
+            delete mergedConfig.training_arguments.fp16_master_weights_and_gradients;
+        } else if (mergedConfig.training_arguments) {
+            mergedConfig.training_arguments.deepspeed = true;
+        }
+
+        // Convert Windows paths to WSL paths when running under WSL
+        if (isWSL) {
+            // Convert all paths in merged config (model paths, output dirs, etc.)
+            const converted = convertPathsInObject(mergedConfig);
+            // Also convert image_dir entries inside dataset.toml -> write a WSL version
+            const datasetPath = path.join(jobPath, 'dataset.toml');
+            if (fs.existsSync(datasetPath)) {
+                const datasetRaw = TOML.parse(fs.readFileSync(datasetPath, 'utf8'));
+                const datasetConverted = convertPathsInObject(datasetRaw);
+                const mergedDatasetPath = path.join(jobPath, '_merged_dataset.toml');
+                fs.writeFileSync(mergedDatasetPath, TOML.stringify(datasetConverted), 'utf8');
+                if (converted.dataset_arguments) {
+                    converted.dataset_arguments.dataset_config = mergedDatasetPath;
+                }
+            }
+            Object.assign(mergedConfig, converted);
+        }
+
+        const mergedConfigPath = path.join(jobPath, '_merged_config.toml');
+        fs.writeFileSync(mergedConfigPath, TOML.stringify(mergedConfig), 'utf8');
+
+        // Ensure output dirs exist
+        const outputDir = path.join(jobPath, 'output');
+        const logsDir = path.join(jobPath, 'logs');
+        if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+        if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+        // Get venv path from global config
+        const globalConfig = getGlobalConfig();
+        const venvPath = toNativePath(globalConfig.venv_path || path.join(ROOT_DIR, 'venv'));
+        const venv = getVenvPaths(venvPath);
+
+        const jobArch = getArchForJob(mergedConfig);
+        const hasNetwork = !!(mergedConfig.network_arguments && mergedConfig.network_arguments.network_module);
+
+        let currentGpuIds = '';
+        try {
+            const rawConfig = TOML.parse(fs.readFileSync(configPath, 'utf8'));
+            currentGpuIds = rawConfig.gpu_ids ? rawConfig.gpu_ids.toString().trim() : '';
+        } catch (err) {
+            console.warn("Failed to parse config for GPU options:", err);
+        }
+
+        const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
+        if (launch.error) {
+            console.error(`[Queue Error] Failed to launch job ${jobName}:`, launch.error);
+            broadcastLog(jobName, `\nLAUNCH ERROR: ${launch.error}\n`);
+            broadcastStatus(jobName, 'idle');
+            processTrainingQueue(); // Continue processing other items in the queue
+            return;
+        }
+        const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
+
+        const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
+            || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
+
+        let trainCmd;
+        if (resolvedMode === 'tp_sp' && tpTrainCmd) {
+            trainCmd = tpTrainCmd;
+        } else {
+            const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+            const targetScript = path.join(ROOT_DIR, scriptName);
+            trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
+        }
+
+        // Spawn training process
+        const isMultiGpu = currentGpuIds && currentGpuIds.split(',').map(s => s.trim()).filter(s => s.length > 0).length > 1;
+        const trainEnvVars = [
+            buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+            buildEnvVar('TOKENIZERS_PARALLELISM', 'false'),
+            gpuEnv,
+            mergedConfig.training_arguments?.step_profile ? buildEnvVar('STEP_PROFILE', '1') : '',
+            mergedConfig.training_arguments?.profile_microbatch ? buildEnvVar('PROFILE_MICROBATCH', '1') : '',
+            (isWindows && isMultiGpu) ? buildEnvVar('USE_LIBUV', '0') : '',
+            (isWindows && isMultiGpu) ? buildEnvVar('MASTER_ADDR', '127.0.0.1') : '',
+            (isWindows && isMultiGpu) ? buildEnvVar('MASTER_PORT', '29500') : ''
+        ].filter(Boolean).join('\n');
+        const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
+
+        const scriptPath = path.join(jobPath, isWindows ? 'launch_command.ps1' : 'launch_command.sh');
+        fs.writeFileSync(scriptPath, trainScript, 'utf8');
+        console.log(`\n--- Training Launch Command for ${jobName} ---`);
+        console.log(trainScript);
+        console.log("----------------------------------------------\n");
+
+        const proc = spawnShell(trainScript, ROOT_DIR);
+
+        const logBuffer = [];
+        const MAX_LOG_LINES = 5000;
+
+        // Write logs to file
+        const logFileName = `train_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
+        const logStream = fs.createWriteStream(path.join(logsDir, logFileName), { flags: 'a' });
+
+        const appendLog = (data) => {
+            const text = data.toString();
+            logBuffer.push(text);
+            if (logBuffer.length > MAX_LOG_LINES) logBuffer.shift();
+            logStream.write(text);
+            broadcastLog(jobName, text);
+        };
+
+        proc.stdout.on('data', appendLog);
+        proc.stderr.on('data', appendLog);
+
+        // Prevent crashes on stream errors
+        proc.stdout.on('error', (err) => console.error(`[Train/stdout] ${err.message}`));
+        proc.stderr.on('error', (err) => console.error(`[Train/stderr] ${err.message}`));
+        logStream.on('error', (err) => console.error(`[Train/LogFile] ${err.message}`));
+
+        proc.on('close', (code) => {
+            const msg = `\n--- Training ${code === 0 ? 'completed' : 'stopped'} (exit code: ${code}) ---\n`;
+            logStream.write(msg);
+            logStream.end();
+            appendLog(Buffer.from(msg));
+            runningJobs.delete(jobName);
+            broadcastStatus(jobName, 'idle');
+            processTrainingQueue();
+        });
+
+        proc.on('error', (err) => {
+            appendLog(Buffer.from(`\nERROR: ${err.message}\n`));
+            runningJobs.delete(jobName);
+            broadcastStatus(jobName, 'idle');
+            processTrainingQueue();
+        });
+
+        runningJobs.set(jobName, {
+            process: proc,
+            pid: proc.pid,
+            startTime: Date.now(),
+            logBuffer,
+            type: 'training',
+            gpuIds: currentGpuIds
+        });
+        broadcastStatus(jobName, 'running');
     } catch (err) {
-        console.warn("Failed to parse config for GPU options:", err);
-    }
-
-    const launch = buildLaunchConfig(currentGpuIds, mergedConfig, mergedConfigPath, jobArch);
-    if (launch.error) {
-        console.error(`[Queue Error] Failed to launch job ${jobName}:`, launch.error);
-        broadcastLog(jobName, `\nLAUNCH ERROR: ${launch.error}\n`);
-        broadcastStatus(jobName, 'idle');
-        processTrainingQueue(); // Continue processing other items in the queue
-        return;
-    }
-    const { gpuEnv, accelerateFlags, tpTrainCmd } = launch;
-
-    const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
-        || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
-
-    let trainCmd;
-    if (resolvedMode === 'tp_sp' && tpTrainCmd) {
-        trainCmd = tpTrainCmd;
-    } else {
-        const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
-        const targetScript = path.join(ROOT_DIR, scriptName);
-        trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
-    }
-
-    // Spawn training process
-    const isMultiGpu = currentGpuIds && currentGpuIds.split(',').map(s => s.trim()).filter(s => s.length > 0).length > 1;
-    const trainEnvVars = [
-        buildEnvVar('PYTHONIOENCODING', 'utf-8'),
-        buildEnvVar('TOKENIZERS_PARALLELISM', 'false'),
-        gpuEnv,
-        mergedConfig.training_arguments?.step_profile ? buildEnvVar('STEP_PROFILE', '1') : '',
-        mergedConfig.training_arguments?.profile_microbatch ? buildEnvVar('PROFILE_MICROBATCH', '1') : '',
-        (isWindows && isMultiGpu) ? buildEnvVar('USE_LIBUV', '0') : '',
-        (isWindows && isMultiGpu) ? buildEnvVar('MASTER_ADDR', '127.0.0.1') : '',
-        (isWindows && isMultiGpu) ? buildEnvVar('MASTER_PORT', '29500') : ''
-    ].filter(Boolean).join('\n');
-    const trainScript = buildShellScript(venv.activate, trainEnvVars, trainCmd);
-
-    const scriptPath = path.join(jobPath, isWindows ? 'launch_command.ps1' : 'launch_command.sh');
-    fs.writeFileSync(scriptPath, trainScript, 'utf8');
-    console.log(`\n--- Training Launch Command for ${jobName} ---`);
-    console.log(trainScript);
-    console.log("----------------------------------------------\n");
-
-    const proc = spawnShell(trainScript, ROOT_DIR);
-
-    const logBuffer = [];
-    const MAX_LOG_LINES = 5000;
-
-    // Write logs to file
-    const logFileName = `train_${new Date().toISOString().replace(/[:.]/g, '-')}.log`;
-    const logStream = fs.createWriteStream(path.join(logsDir, logFileName), { flags: 'a' });
-
-    const appendLog = (data) => {
-        const text = data.toString();
-        logBuffer.push(text);
-        if (logBuffer.length > MAX_LOG_LINES) logBuffer.shift();
-        logStream.write(text);
-        broadcastLog(jobName, text);
-    };
-
-    proc.stdout.on('data', appendLog);
-    proc.stderr.on('data', appendLog);
-
-    // Prevent crashes on stream errors
-    proc.stdout.on('error', (err) => console.error(`[Train/stdout] ${err.message}`));
-    proc.stderr.on('error', (err) => console.error(`[Train/stderr] ${err.message}`));
-    logStream.on('error', (err) => console.error(`[Train/LogFile] ${err.message}`));
-
-    proc.on('close', (code) => {
-        const msg = `\n--- Training ${code === 0 ? 'completed' : 'stopped'} (exit code: ${code}) ---\n`;
-        logStream.write(msg);
-        logStream.end();
-        appendLog(Buffer.from(msg));
-        runningJobs.delete(jobName);
+        console.error(`[Queue Error] executeTraining failed for ${jobName}:`, err);
+        broadcastLog(jobName, `\nEXECUTION ERROR: ${err.message}\n`);
         broadcastStatus(jobName, 'idle');
         processTrainingQueue();
-    });
-
-    proc.on('error', (err) => {
-        appendLog(Buffer.from(`\nERROR: ${err.message}\n`));
-        runningJobs.delete(jobName);
-        broadcastStatus(jobName, 'idle');
-        processTrainingQueue();
-    });
-
-    runningJobs.set(jobName, {
-        process: proc,
-        pid: proc.pid,
-        startTime: Date.now(),
-        logBuffer,
-        type: 'training',
-        gpuIds: currentGpuIds
-    });
-    broadcastStatus(jobName, 'running');
+    }
 }
 
 function processTrainingQueue() {

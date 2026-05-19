@@ -50,11 +50,11 @@
             </div>
             <div class="sidebar-footer">
                 <div id="queue-container" class="queue-container">
-                    <button id="btn-toggle-queue" class="btn btn-ghost btn-block" style="display: flex; justify-content: space-between; align-items: center;">
+                    <button id="btn-toggle-queue" class="btn btn-ghost btn-block" aria-controls="queue-panel" aria-expanded="false" style="display: flex; justify-content: space-between; align-items: center;">
                         <span style="display: flex; align-items: center; gap: 8px;">⏳ Queue</span>
                         <span id="queue-badge" class="queue-badge hidden">0</span>
                     </button>
-                    <div id="queue-panel" class="queue-panel hidden">
+                    <div id="queue-panel" class="queue-panel hidden" role="region" aria-label="Training queue">
                         <ul id="queue-list" class="queue-list">
                             </ul>
                     </div>
