@@ -79,12 +79,20 @@ function connectWS() {
         updateHwMonitor(msg.data);
         return;
       }
-      if (msg.job !== currentJob) return;
       if (msg.type === "log") {
-        appendConsole(msg.data);
+        // Only append console logs if we are actually looking at this job
+        if (msg.job === currentJob) {
+          appendConsole(msg.data);
+        }
       } else if (msg.type === "status") {
         if (msg.data === "generating") return; // Ignore generation status for Training button
-        updateJobStatus(msg.data);
+
+        // Refresh the queue UI if a relevant state changed
+        if (['queued', 'dequeued', 'running', 'idle'].includes(msg.data)) {
+            loadQueueUI();
+        }
+
+        updateJobStatus(msg.job, msg.data);
       }
     } catch (e) { }
   };
@@ -251,8 +259,13 @@ async function loadJobs() {
     return;
   }
   jobs.forEach((job) => {
+    // Determine the correct status class based on the new API payload
+    let statusClass = "";
+    if (job.running) statusClass = " running";
+    else if (job.queued) statusClass = " queued";
+
     const el = document.createElement("div");
-    el.className = `job-item${job.name === currentJob ? " active" : ""}${job.running ? " running" : ""}`;
+    el.className = `job-item${job.name === currentJob ? " active" : ""}${statusClass}`;
     el.innerHTML = `
             <div class="status-dot"></div>
             <span class="job-name">${job.name}</span>
@@ -289,11 +302,11 @@ async function selectJob(name) {
     const queue = await api("/api/train/queue");
     const isQueued = queue.includes(name);
     if (status.running) {
-    updateJobStatus("running");
+    updateJobStatus(name, "running");
     } else if (isQueued) {
-        updateJobStatus("queued");
+        updateJobStatus(name, "queued");
     } else {
-        updateJobStatus("idle");
+        updateJobStatus(name, "idle");
     }
     // Set default negative prompt if no saved value exists for this job
     const savedTransient = localStorage.getItem(`prompt_transient_${name}`);
@@ -336,31 +349,34 @@ async function selectJob(name) {
 // dataset properties, or prompt arrays up until the precise second that 
 // the background worker pops the job from the queue and invokes the process.
 
-function updateJobStatus(status) {
-  const runBtn = $("btn-run");
-  const stopBtn = $("btn-stop");
+function updateJobStatus(jobName, status) {
+  // Only update editor buttons if this is the active job
+  if (jobName === currentJob) {
+    const runBtn = $("btn-run");
+    const stopBtn = $("btn-stop");
 
-  if (status === "running") {
-    runBtn.classList.add("hidden");
-    stopBtn.classList.remove("hidden");
-    stopBtn.textContent = "⏹ Stop Training";
-    stopBtn.className = "btn btn-danger";
-  } else if (status === "queued") {
-    runBtn.classList.add("hidden");
-    stopBtn.classList.remove("hidden");
-    stopBtn.textContent = "⏹ Cancel Queue";
-    stopBtn.className = "btn btn-warning";
-  } else { // idle, dequeued, stopping, etc.
-    runBtn.classList.remove("hidden");
-    runBtn.textContent = "▶ Train";
-    runBtn.className = "btn btn-success";
-    stopBtn.classList.add("hidden");
+    if (status === "running") {
+      runBtn.classList.add("hidden");
+      stopBtn.classList.remove("hidden");
+      stopBtn.textContent = "⏹ Stop Training";
+      stopBtn.className = "btn btn-danger";
+    } else if (status === "queued") {
+      runBtn.classList.add("hidden");
+      stopBtn.classList.remove("hidden");
+      stopBtn.textContent = "⏹ Cancel Queue";
+      stopBtn.className = "btn btn-warning";
+    } else {
+      runBtn.classList.remove("hidden");
+      runBtn.textContent = "▶ Train";
+      runBtn.className = "btn btn-success";
+      stopBtn.classList.add("hidden");
+    }
   }
 
-  // Sync sidebar indicators across all states
+  // Always sync sidebar indicators regardless of what job is selected
   document.querySelectorAll(".job-item").forEach((el) => {
     const name = el.querySelector(".job-name").textContent;
-    if (name === currentJob) {
+    if (name === jobName) {
       el.classList.remove("running", "queued");
       if (status === "running") {
         el.classList.add("running");
@@ -2518,6 +2534,75 @@ $("cfg-text-shadow").oninput = (e) => {
 $("cfg-theme").onchange = (e) => {
   applyTheme(e.target.value);
 };
+
+// ==========================================
+//  Queue UI
+// ==========================================
+async function loadQueueUI() {
+    try {
+        const queue = await api("/api/train/queue");
+        const badge = $("queue-badge");
+        const list = $("queue-list");
+
+        // Update Badge
+        if (queue.length > 0) {
+            badge.textContent = queue.length;
+            badge.classList.remove("hidden");
+        } else {
+            badge.classList.add("hidden");
+        }
+
+        // Render List
+        list.innerHTML = "";
+        if (queue.length === 0) {
+            list.innerHTML = '<li style="padding: 12px; text-align: center; color: var(--text-muted); font-size: 0.8rem;">Queue is empty</li>';
+            return;
+        }
+
+        queue.forEach((job, index) => {
+            const li = document.createElement("li");
+            li.className = "queue-item";
+            li.innerHTML = `
+                <span class="queue-item-name" title="${escapeHtml(job)}">
+                    <span style="color:var(--text-muted); margin-right:4px;">${index + 1}.</span>
+                    ${escapeHtml(job)}
+                </span>
+                <button class="btn-remove-queue" title="Remove from queue">✕</button>
+            `;
+
+            // Remove Button Click
+            li.querySelector(".btn-remove-queue").addEventListener("click", (e) => {
+                e.stopPropagation();
+                removeFromQueue(job);
+            });
+            list.appendChild(li);
+        });
+    } catch (err) {
+        console.error("Failed to load queue:", err);
+    }
+}
+
+async function removeFromQueue(jobName) {
+    showConfirm("Remove from Queue", `Remove "${jobName}" from the training queue?`, async () => {
+        await api(`/api/jobs/${jobName}/train/stop`, { method: "POST" });
+        await loadQueueUI();
+
+        // If the user happens to have this job open in the editor, revert its buttons
+        if (currentJob === jobName) {
+            updateJobStatus(jobName, "idle");
+        } else {
+            // Update the sidebar dot for the background job
+            updateJobStatus(jobName, "idle");
+        }
+        showToast("Job removed from queue");
+    });
+}
+
+// Queue Toggle Binding
+$("btn-toggle-queue").addEventListener("click", () => {
+    $("queue-panel").classList.toggle("hidden");
+});
+
 // ==========================================
 //  Modals & Helpers
 // ==========================================
@@ -3133,12 +3218,10 @@ $("btn-run").addEventListener("click", async () => {
     alert(result.error);
     return;
   }
-  updateJobStatus("queued");
   consoleOutput.textContent = "";
   if (warningMsg) appendConsole(warningMsg);
-  // Auto-switch to console tab
   document.querySelector('[data-tab="console"]').click();
-  showToast("Training started");
+  showToast(result.status === 'queued' ? "Job added to queue" : "Training started");
 });
 // Generate
 $("btn-gen-sample").addEventListener("click", async () => {
@@ -3207,7 +3290,7 @@ $("btn-stop").addEventListener("click", () => {
     message,
     async () => {
       await api(`/api/jobs/${currentJob}/train/stop`, { method: "POST" });
-      updateJobStatus("idle");
+      updateJobStatus(currentJob, "idle");
       showToast(isCancelQueue ? "Job removed from queue" : "Training stopped");
     },
   );
@@ -3426,6 +3509,8 @@ async function init() {
   // 2. Normal Init
   connectWS();
   await loadJobs();
+  // Load queue
+  loadQueueUI();
   // Start status polling
   setInterval(updateGPUActivity, 3000);
   // Watch for config changes

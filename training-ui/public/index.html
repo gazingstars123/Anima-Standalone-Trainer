@@ -49,6 +49,16 @@
                 <!-- Jobs rendered here -->
             </div>
             <div class="sidebar-footer">
+                <div id="queue-container" class="queue-container">
+                    <button id="btn-toggle-queue" class="btn btn-ghost btn-block" style="display: flex; justify-content: space-between; align-items: center;">
+                        <span style="display: flex; align-items: center; gap: 8px;">⏳ Queue</span>
+                        <span id="queue-badge" class="queue-badge hidden">0</span>
+                    </button>
+                    <div id="queue-panel" class="queue-panel hidden">
+                        <ul id="queue-list" class="queue-list">
+                            </ul>
+                    </div>
+                </div>
                 <button id="btn-global-settings" class="btn btn-ghost btn-block">⚙️ Global Settings</button>
             </div>
         </aside>

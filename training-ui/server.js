@@ -327,15 +327,13 @@ function broadcastLog(jobName, message) {
 }
 
 function broadcastStatus(jobName, status) {
-    const clients = wsClients.get(jobName);
-    if (clients) {
-        const data = JSON.stringify({ job: jobName, type: 'status', data: status });
-        clients.forEach(ws => {
-            if (ws.readyState === WebSocket.OPEN) {
-                ws.send(data);
-            }
-        });
-    }
+    // Send status to ALL connected clients so the sidebar and queue panel stay in sync
+    const data = JSON.stringify({ job: jobName, type: 'status', data: status });
+    wss.clients.forEach(ws => {
+        if (ws.readyState === WebSocket.OPEN) {
+            ws.send(data);
+        }
+    });
 }
 
 // Find the most recently modified state folder in a job's output directory
@@ -615,10 +613,13 @@ app.get('/api/jobs', (req, res) => {
                 if (hasConfig) {
                     try { mtime = fs.statSync(configPath).mtimeMs; } catch (e) { }
                 }
+                const jobData = runningJobs.get(d.name);
+                const isRunning = jobData ? jobData.type === 'training' : false;
                 return {
                     name: d.name,
                     hasConfig,
-                    running: runningJobs.has(d.name),
+                    running: isRunning,
+                    queued: trainingQueue.includes(d.name),
                     mtime
                 };
             })
@@ -1510,7 +1511,8 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         broadcastStatus(jobName, 'queued');
         processTrainingQueue();
 
-        res.json({ success: true, status: 'queued' });
+        const isRunning = runningJobs.has(jobName);
+        res.json({ success: true, status: isRunning ? 'running' : 'queued' });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
