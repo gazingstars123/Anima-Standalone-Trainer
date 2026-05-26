@@ -23,6 +23,7 @@ persistent_data_loader_workers = true
 seed = 42
 cache_latents_to_disk = true
 cache_text_encoder_outputs_to_disk = true
+timestep_bias_strategy = "none"
 sample_every_n_epochs = 1
 
 [network_arguments]

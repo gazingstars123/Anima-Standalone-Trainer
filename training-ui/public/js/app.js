@@ -404,6 +404,7 @@ function populateConfig(config) {
   $("cfg-vae-batch").value = t.vae_batch_size ?? 1;
   $("cfg-cache-te").checked = t.cache_text_encoder_outputs_to_disk ?? true;
   $("cfg-disable-bucket-shuffle").checked = t.disable_bucket_shuffle ?? false;
+  $("cfg-timestep-bias-strategy").value = t.timestep_bias_strategy || "none";
   // Progressive resolution schedule
   if (t.resolution_schedule) {
     $("cfg-progressive-reso").checked = true;
@@ -777,6 +778,7 @@ function gatherConfig() {
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
+      timestep_bias_strategy: $("cfg-timestep-bias-strategy").value,
       // Progressive resolution schedule
       ...(() => {
         if (!$("cfg-progressive-reso").checked) return {};
