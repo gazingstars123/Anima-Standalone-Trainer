@@ -6216,6 +6216,11 @@ def get_timesteps(
     if strategy is None:
         raise ValueError(f"Unknown timestep bias strategy: {timestep_bias_strategy}")
 
+    if min_timestep >= max_timestep:
+        raise ValueError(
+            f"min_timestep must be less than max_timestep, got {min_timestep} >= {max_timestep}"
+        )
+
     if min_timestep < max_timestep:
         max_index = max_timestep - 1
         if strategy == "none":
@@ -6229,8 +6234,6 @@ def get_timesteps(
 
             timestep_span = max(max_index - min_timestep, 0)
             timesteps = (biased_timesteps * timestep_span + min_timestep).long().clamp(min_timestep, max_index)
-    else:
-        timesteps = torch.full((b_size,), max_timestep, device="cpu")
     timesteps = timesteps.long().to(device)
     return timesteps
 
