@@ -1054,7 +1054,7 @@ function renderSubsets() {
 //  Save
 // ==========================================
 async function saveJob() {
-  if (!currentJob) return;
+  if (!currentJob) return false;
   const config = gatherConfig();
   const dataset = gatherDataset();
   // Prevent duplicate directories
@@ -1066,15 +1066,20 @@ async function saveJob() {
     showToast(
       "Error: Duplicate Image Directories detected. Each subset must have a unique path.",
     );
-    return;
+    return false;
   }
-  // Save Config & Dataset
-  await api(`/api/jobs/${currentJob}`, {
-    method: "PUT",
-    body: { config, dataset },
-  });
-  // Save Prompts
-  await savePrompts();
+  try {
+    // Save Config & Dataset
+    await api(`/api/jobs/${currentJob}`, {
+      method: "PUT",
+      body: { config, dataset },
+    });
+    // Save Prompts
+    await savePrompts();
+  } catch (err) {
+    showToast("Error saving job: " + err.message);
+    return false;
+  }
   // Update last saved state
   lastSavedConfig = JSON.parse(JSON.stringify(config));
   lastSavedDataset = JSON.parse(JSON.stringify(dataset));
@@ -1082,6 +1087,7 @@ async function saveJob() {
   lastSavedNegativePrompt = $("global-negative-prompt").value;
   checkDirty();
   showToast("Job saved");
+  return true;
 }
 function checkDirty() {
   if (!currentJob) return;
@@ -3237,7 +3243,7 @@ $("btn-run").addEventListener("click", async () => {
       "Sampling is enabled but no prompts are defined.\n\nContinue training without generating samples...\n\n";
   }
   // Auto-save first
-  if (isDirty) await saveJob();
+  if (isDirty && !(await saveJob())) return;
   const result = await api(`/api/jobs/${currentJob}/train/start`, {
     method: "POST",
   });
@@ -3256,7 +3262,7 @@ $("btn-run").addEventListener("click", async () => {
 $("btn-gen-sample").addEventListener("click", async () => {
   if (!currentJob) return;
   savePromptTransientSettings();
-  if (isDirty) await saveJob();
+  if (isDirty && !(await saveJob())) return;
   if (currentPrompts.length === 0) {
     showToast("Add sample prompts first");
     return;
