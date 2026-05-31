@@ -479,6 +479,12 @@ class AdditionalNetwork(torch.nn.Module):
 
         # Anima emb_dims pass: x_embedder / t_embedder / final_layer
         if self.emb_dims:
+            # filter="final_layer" also matches modules the main pass already created via
+            # the mod_dim per-type dispatch (e.g. final_layer.adaln_modulation.*). Skip those
+            # duplicates so mod_dim + emb_dims is a legal combo (it tripped the dedup assert
+            # below at startup); the per-type dispatch runs here too, so the skipped module
+            # keeps the same mod_dim either way.
+            existing_names = {lora.lora_name for lora in self.unet_loras}
             for filter_name, in_dim in zip(["x_embedder", "t_embedder", "final_layer"], self.emb_dims):
                 if not in_dim:
                     continue
@@ -489,7 +495,11 @@ class AdditionalNetwork(torch.nn.Module):
                     filter=filter_name,
                     include_conv2d_if_filter=(filter_name == "x_embedder"),
                 )
-                self.unet_loras.extend(emb_loras)
+                for lora in emb_loras:
+                    if lora.lora_name in existing_names:
+                        continue
+                    existing_names.add(lora.lora_name)
+                    self.unet_loras.append(lora)
 
         logger.info(f"create {module_class.__name__} for UNet/DiT: {len(self.unet_loras)} modules.")
 
