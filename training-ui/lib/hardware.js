@@ -3,6 +3,7 @@ const os = require('os');
 const WebSocket = require('ws');
 
 const isWindows = process.platform === 'win32';
+const isWSL = process.platform === 'linux' && !!process.env.WSL_DISTRO_NAME;
 const HW_MONITOR_INTERVAL_MS = 1000;
 
 let prevCpuInfo = null;
@@ -97,6 +98,21 @@ function runSingleFlightProbe(state, spawnChild, timeoutMs, parseResult) {
 const cpuTempProbeState = { pending: false };
 const gpuStatsProbeState = { pending: false };
 
+let gpuSmiBinary = 'nvidia-smi';
+
+function probeWslSmiExe() {
+    if (!isWSL) return;
+    const probe = spawn('nvidia-smi.exe', ['--query-gpu=index', '--format=csv,noheader'], { windowsHide: true });
+    let stdout = '';
+    const timeout = setTimeout(() => terminateChildProcess(probe, { force: true }), 4000);
+    probe.stdout.on('data', (data) => { stdout += data; });
+    probe.on('close', (code) => {
+        clearTimeout(timeout);
+        if (code === 0 && stdout.trim()) gpuSmiBinary = 'nvidia-smi.exe';
+    });
+    probe.on('error', () => { clearTimeout(timeout); });
+}
+
 function getCpuTemp() {
     return runSingleFlightProbe(
         cpuTempProbeState,
@@ -133,7 +149,7 @@ function getCpuTemp() {
 function getGpuStats() {
     return runSingleFlightProbe(
         gpuStatsProbeState,
-        () => spawn('nvidia-smi', [
+        () => spawn(gpuSmiBinary, [
             '--query-gpu=index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw,power.limit',
             '--format=csv,noheader,nounits'
         ], { windowsHide: true }),
@@ -161,6 +177,7 @@ function getGpuStats() {
 // wss       - WebSocket.Server instance
 // getActiveGpus - () => { [gpuIndex]: 'training'|'sampling' }
 function startHardwareMonitor(wss, getActiveGpus) {
+    probeWslSmiExe();
     setInterval(async () => {
         if (wss.clients.size === 0) return;
 
