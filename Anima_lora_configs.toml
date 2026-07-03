@@ -1,4 +1,4 @@
-# Anima LoRA Training Configuration
+# Anima Training Configuration (LoRA / LoHa / LoKr)
 
 [model_arguments]
 dit_path = "/path/to/anima-preview.safetensors"
@@ -9,7 +9,6 @@ vae_path = "/path/to/qwen_image_vae.safetensors"
 dataset_config = "/path/to/dataset.toml"
 cache_latents_to_disk = true
 cache_text_encoder_outputs = true
-# train_data_dir is not needed when using dataset_config
 
 
 [training_arguments]
@@ -41,14 +40,22 @@ sample_prompts = "./sample_prompts.txt"
 sample_every_n_epochs = 1
 
 [network_arguments]
+# Pick one network module:
 network_module = "networks.lora_anima"
+# network_module = "networks.loha"
+# network_module = "networks.lokr"
+
 network_dim = 16
 network_alpha = 16
 network_train_unet_only = true
 
-# To initialize from a LoRA checkpoint (start new training with these weights):
-# network_weights = "path\\to\\lora.safetensors"
+# Suggested network_args per module:
+#   LoRA:  network_args = [ ]
+#   LoHa:  network_args = [ "mod_dim=4" ]
+#   LoKr:  network_args = [ "factor=-1", "mod_dim=4" ]
+#
+# Full kwarg reference: networks/{lora_anima,loha,lokr}.py:create_network
+# UI dedicated fields: Factor (LoKr only), Mod Dim, Rank Dropout, Module Dropout, Use Tucker.
 
-# To resume training state (start from a saved state folder):
-# resume = "path\\to\\saved_state_folder"
-
+# network_weights = "/path/to/lora.safetensors"   # initialize from a saved network
+# resume = "/path/to/saved_state_folder"          # resume training state

@@ -526,7 +526,11 @@ function populateConfig(config) {
   $("cfg-resume").value = n.resume || "";
   $("cfg-resume").disabled = $("cfg-auto-resume").checked;
   $("cfg-network-dropout").value = n.network_dropout ?? 0;
-  $("cfg-network-args").value = (n.network_args || []).join(" ");
+  // Fresh-load path: partition the saved network_args directly against the
+  // current module's active set. (The dropdown-change handler instead calls
+  // redistributeForModuleChange to preserve user-edited state across modes.)
+  loadNetworkArgs(n.network_args || []);
+  updateLycorisExtrasUI($("cfg-network-module").value);
 }
 function populateDataset(dataset) {
   const g = dataset.general || {};
@@ -803,9 +807,10 @@ function gatherConfig() {
           ...(safeFloat($("cfg-network-dropout").value) > 0 && {
             network_dropout: safeFloat($("cfg-network-dropout").value),
           }),
-          ...($("cfg-network-args").value.trim() && {
-            network_args: $("cfg-network-args").value.trim().split(/\s+/),
-          }),
+          ...(() => {
+            const args = gatherNetworkArgs();
+            return args.length > 0 ? { network_args: args } : {};
+          })(),
           ...($("cfg-network-weights").value && {
             network_weights: $("cfg-network-weights").value,
           }),
@@ -1049,7 +1054,7 @@ function renderSubsets() {
 //  Save
 // ==========================================
 async function saveJob() {
-  if (!currentJob) return;
+  if (!currentJob) return false;
   const config = gatherConfig();
   const dataset = gatherDataset();
   // Prevent duplicate directories
@@ -1061,15 +1066,20 @@ async function saveJob() {
     showToast(
       "Error: Duplicate Image Directories detected. Each subset must have a unique path.",
     );
-    return;
+    return false;
   }
-  // Save Config & Dataset
-  await api(`/api/jobs/${currentJob}`, {
-    method: "PUT",
-    body: { config, dataset },
-  });
-  // Save Prompts
-  await savePrompts();
+  try {
+    // Save Config & Dataset
+    await api(`/api/jobs/${currentJob}`, {
+      method: "PUT",
+      body: { config, dataset },
+    });
+    // Save Prompts
+    await savePrompts();
+  } catch (err) {
+    showToast("Error saving job: " + err.message);
+    return false;
+  }
   // Update last saved state
   lastSavedConfig = JSON.parse(JSON.stringify(config));
   lastSavedDataset = JSON.parse(JSON.stringify(dataset));
@@ -1077,6 +1087,7 @@ async function saveJob() {
   lastSavedNegativePrompt = $("global-negative-prompt").value;
   checkDirty();
   showToast("Job saved");
+  return true;
 }
 function checkDirty() {
   if (!currentJob) return;
@@ -1133,8 +1144,155 @@ function updateTrainingTypeUI(type) {
 }
 $("cfg-training-type").addEventListener("change", (e) => {
   updateTrainingTypeUI(e.target.value);
+  updateLycorisExtrasUI($("cfg-network-module").value);
   checkDirty();
 });
+
+// Keys handled by the LoHa/LoKr dedicated UI fields. Same set drives save, load,
+// and module-switch redistribution: dedicated values override matching keys in
+// the freeform Network Args text box.
+const LYCORIS_DEDICATED_KEYS = ["factor", "mod_dim", "rank_dropout", "module_dropout", "use_tucker"];
+
+// Read a dedicated number field. Returns the value string if valid, else null.
+// Validation is regex-based on the string form because Number()-based checks
+// would accept e.g. "1e2"/"0x10"/"5.0" as integers — those parse fine in JS
+// but Python's int() rejects them, crashing training. Backend would still
+// reject; this is just a friendlier UX layer.
+function _readNumberField(id, requireInt) {
+  const v = $(id).value.trim();
+  if (v === "") return null;
+  const pattern = requireInt
+    ? /^[+-]?\d+$/                                   // plain decimal int (e.g. -1, 0, +8)
+    : /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;    // float: 0.1, .5, 5., +0.1, 1e-3
+  if (!pattern.test(v)) return null;
+  // Catch overflow that the regex alone doesn't reject (e.g. 1e1000 -> Infinity).
+  if (!Number.isFinite(Number(v))) return null;
+  return v;
+}
+
+// Show/hide LoHa/LoKr dedicated fields based on network module.
+// Factor sub-wrapper is only relevant for LoKr; everything else is shared.
+function updateLycorisExtrasUI(networkModule) {
+  const isLoha = networkModule === "networks.loha";
+  const isLokr = networkModule === "networks.lokr";
+  $("lycoris-extras-section").classList.toggle("hidden", !(isLoha || isLokr));
+  $("lokr-only-fields").classList.toggle("hidden", !isLokr);
+}
+$("cfg-network-module").addEventListener("change", (e) => {
+  // Carry user-edited state across the active-set change: the dropdown handler
+  // is the "user mid-edit" path, in contrast with populateForm which is the
+  // "fresh load" path and just calls loadNetworkArgs directly.
+  redistributeForModuleChange();
+  updateLycorisExtrasUI(e.target.value);
+  checkDirty();
+});
+
+// On module change, repartition everything currently in dedicated fields + freeform
+// against the NEW module's active set. Dedicated tokens win dedup on key collision
+// (their first-position in the collected list shadows the freeform copy).
+function redistributeForModuleChange() {
+  const tokens = [];
+  const factor = _readNumberField("cfg-lokr-factor", true);
+  if (factor !== null) tokens.push(`factor=${factor}`);
+  const modDim = _readNumberField("cfg-mod-dim", true);
+  if (modDim !== null) tokens.push(`mod_dim=${modDim}`);
+  const rankDropout = _readNumberField("cfg-rank-dropout", false);
+  if (rankDropout !== null) tokens.push(`rank_dropout=${rankDropout}`);
+  const moduleDropout = _readNumberField("cfg-module-dropout", false);
+  if (moduleDropout !== null) tokens.push(`module_dropout=${moduleDropout}`);
+  if ($("cfg-use-tucker").checked) tokens.push("use_tucker=true");
+  const freeform = $("cfg-network-args").value.trim();
+  if (freeform) tokens.push(...freeform.split(/\s+/));
+  const seen = new Set();
+  const merged = tokens.filter((tok) => {
+    const eq = tok.indexOf("=");
+    const key = (eq >= 0 ? tok.slice(0, eq) : tok).trim();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  loadNetworkArgs(merged);
+}
+
+// Which dedicated keys are "active" for a given network_module. LoKr accepts the
+// full set including factor; LoHa accepts everything except factor; other modules
+// treat dedicated fields as inactive (their values aren't emitted, freeform pass-through).
+function activeDedicatedKeys(networkModule) {
+  if (networkModule === "networks.lokr") return LYCORIS_DEDICATED_KEYS;
+  if (networkModule === "networks.loha") return LYCORIS_DEDICATED_KEYS.filter((k) => k !== "factor");
+  return [];
+}
+
+// Build the `network_args` array emitted into the per-job TOML. Dedicated fields
+// take precedence over the freeform text box on key collision (the freeform copy
+// is dropped).
+function gatherNetworkArgs() {
+  const active = activeDedicatedKeys($("cfg-network-module").value);
+  const dedicated = [];
+  if (active.includes("factor")) {
+    const v = _readNumberField("cfg-lokr-factor", true);
+    if (v !== null) dedicated.push(`factor=${v}`);
+  }
+  if (active.includes("mod_dim")) {
+    const v = _readNumberField("cfg-mod-dim", true);
+    if (v !== null) dedicated.push(`mod_dim=${v}`);
+  }
+  if (active.includes("rank_dropout")) {
+    const v = _readNumberField("cfg-rank-dropout", false);
+    if (v !== null) dedicated.push(`rank_dropout=${v}`);
+  }
+  if (active.includes("module_dropout")) {
+    const v = _readNumberField("cfg-module-dropout", false);
+    if (v !== null) dedicated.push(`module_dropout=${v}`);
+  }
+  if (active.includes("use_tucker") && $("cfg-use-tucker").checked) {
+    dedicated.push("use_tucker=true");
+  }
+  const freeformRaw = $("cfg-network-args").value.trim();
+  const freeform = freeformRaw
+    ? freeformRaw.split(/\s+/).filter((tok) => {
+        const eq = tok.indexOf("=");
+        const key = (eq >= 0 ? tok.slice(0, eq) : tok).trim();
+        return !active.includes(key);
+      })
+    : [];
+  return [...dedicated, ...freeform];
+}
+
+// Split a loaded `network_args` array into dedicated form fields + freeform text box.
+// Inverse of gatherNetworkArgs. Keys not active for the current module stay in freeform
+// (e.g. an old LoKr-saved `factor=8` loaded into LoHa goes into the freeform box).
+function loadNetworkArgs(args) {
+  const active = activeDedicatedKeys($("cfg-network-module").value);
+  const dedicated = {};
+  const freeform = [];
+  for (const raw of args) {
+    // Trim per-token: TOML arrays can legally contain "  factor=8  " entries; the
+    // split-on-/\s+/ path doesn't, but the array-from-disk path needs hygiene here.
+    const tok = String(raw).trim();
+    if (!tok) continue;
+    const eq = tok.indexOf("=");
+    if (eq < 0) {
+      freeform.push(tok);
+      continue;
+    }
+    // Inner-trim each part: TOML can carry "factor = 8" with spaces around `=`,
+    // which would otherwise produce key="factor " (trailing ws) → active.includes
+    // fails → silent freeform misclassification. Symmetric on val so number inputs
+    // don't receive leading/trailing whitespace.
+    const key = tok.slice(0, eq).trim();
+    const val = tok.slice(eq + 1).trim();
+    if (active.includes(key)) dedicated[key] = val;
+    else freeform.push(tok);
+  }
+  $("cfg-lokr-factor").value = dedicated.factor ?? "";
+  $("cfg-mod-dim").value = dedicated.mod_dim ?? "";
+  $("cfg-rank-dropout").value = dedicated.rank_dropout ?? "";
+  $("cfg-module-dropout").value = dedicated.module_dropout ?? "";
+  const tucker = (dedicated.use_tucker || "").toLowerCase();
+  $("cfg-use-tucker").checked = ["true", "1", "yes", "y"].includes(tucker);
+  $("cfg-network-args").value = freeform.join(" ");
+}
 
 // Disable manual resume path when auto-resume is enabled
 $("cfg-auto-resume").addEventListener("change", (e) => {
@@ -3085,7 +3243,7 @@ $("btn-run").addEventListener("click", async () => {
       "Sampling is enabled but no prompts are defined.\n\nContinue training without generating samples...\n\n";
   }
   // Auto-save first
-  if (isDirty) await saveJob();
+  if (isDirty && !(await saveJob())) return;
   const result = await api(`/api/jobs/${currentJob}/train/start`, {
     method: "POST",
   });
@@ -3104,7 +3262,7 @@ $("btn-run").addEventListener("click", async () => {
 $("btn-gen-sample").addEventListener("click", async () => {
   if (!currentJob) return;
   savePromptTransientSettings();
-  if (isDirty) await saveJob();
+  if (isDirty && !(await saveJob())) return;
   if (currentPrompts.length === 0) {
     showToast("Add sample prompts first");
     return;

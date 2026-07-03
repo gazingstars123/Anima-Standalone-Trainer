@@ -423,6 +423,8 @@
                                 <label>Network Module</label>
                                 <select id="cfg-network-module">
                                     <option value="networks.lora_anima">LoRA (Anima)</option>
+                                    <option value="networks.loha">LoHa (Anima)</option>
+                                    <option value="networks.lokr">LoKr (Anima)</option>
                                     <option value="networks.lora_lumina">LoRA (Lumina)</option>
                                     <option value="networks.lora">LoRA (Standard)</option>
                                 </select>
@@ -454,6 +456,39 @@
                                 <label>Network Args</label>
                                 <input type="text" id="cfg-network-args" placeholder="e.g. conv_dim=4 conv_alpha=4">
                                 <small>Space-separated key=value pairs passed to the network module.</small>
+                            </div>
+                            <div id="lycoris-extras-section" class="hidden">
+                                <h5>LyCORIS Options</h5>
+                                <div id="lokr-only-fields" class="hidden">
+                                    <div class="form-group">
+                                        <label>Factor</label>
+                                        <input type="number" id="cfg-lokr-factor" step="1" min="-1" placeholder="auto (-1)">
+                                        <small>Kronecker factor. Empty = auto. Overrides any matching key in Network Args above.</small>
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Mod Dim</label>
+                                        <input type="number" id="cfg-mod-dim" step="1" min="0" placeholder="excluded">
+                                        <small>Rank for adaln_modulation_*. Empty = excluded. Overrides Network Args.</small>
+                                    </div>
+                                    <div class="form-group">
+                                        <label>Rank Dropout</label>
+                                        <input type="number" id="cfg-rank-dropout" step="0.05" min="0" max="1" placeholder="off">
+                                        <small>Per-forward dropout on the adapter's output channels (LyCORIS rank_dropout — not the rank dim). 0..1, empty = off. Overrides Network Args.</small>
+                                    </div>
+                                </div>
+                                <div class="form-row">
+                                    <div class="form-group">
+                                        <label>Module Dropout</label>
+                                        <input type="number" id="cfg-module-dropout" step="0.05" min="0" max="1" placeholder="off">
+                                        <small>Drop whole modules each forward (0..1). Empty = off. Overrides Network Args.</small>
+                                    </div>
+                                    <div class="form-group">
+                                        <label><input type="checkbox" id="cfg-use-tucker"> Use Tucker</label>
+                                        <small>Tucker-decompose Conv2d 3x3. Anima DiT is all Linear — no effect today.</small>
+                                    </div>
+                                </div>
                             </div>
                             <div class="form-group">
                                 <label>Network Weights (LoRA checkpoint)</label>

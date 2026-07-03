@@ -2,7 +2,7 @@
   "architectures": {
     "anima": {
       "display_name": "Anima",
-      "network_modules": ["networks.lora_anima"],
+      "network_modules": ["networks.lora_anima", "networks.loha", "networks.lokr"],
       "scripts": {
         "train": "anima_train.py",
         "train_network": "anima_train_network.py",

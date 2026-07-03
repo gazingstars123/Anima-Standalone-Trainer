@@ -971,6 +971,13 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
         if (validIds.length > 1) {
             if (mode === 'tp_sp') {
                 const hasNet = !!(mergedConfig.network_arguments?.network_module);
+                // LoHa/LoKr explicitly NotImplementedError on TP/SP today (see networks/loha.py
+                // and networks/lokr.py _is_tp_active guard) - fail fast at launch instead of
+                // crashing deep in create_network.
+                const netModule = mergedConfig.network_arguments?.network_module || '';
+                if (netModule === 'networks.loha' || netModule === 'networks.lokr') {
+                    return { error: `${netModule} does not support TP/SP yet (single-GPU only). Use networks.lora_anima for multi-GPU TP/SP, or switch parallelism mode to DDP/FSDP.` };
+                }
                 const tpScript = hasNet
                     ? jobArch.scripts?.train_network_tp_sp
                     : jobArch.scripts?.train_tp_sp;
