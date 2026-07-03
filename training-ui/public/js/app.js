@@ -404,6 +404,9 @@ function populateConfig(config) {
   $("cfg-vae-batch").value = t.vae_batch_size ?? 1;
   $("cfg-cache-te").checked = t.cache_text_encoder_outputs_to_disk ?? true;
   $("cfg-disable-bucket-shuffle").checked = t.disable_bucket_shuffle ?? false;
+  $("cfg-timestep-bias-strategy").value = normalizeTimestepBiasStrategy(
+    t.timestep_bias_strategy,
+  );
   // Progressive resolution schedule
   if (t.resolution_schedule) {
     $("cfg-progressive-reso").checked = true;
@@ -618,6 +621,22 @@ function safeFloat(val, fallback = 0.0) {
   const p = parseFloat(val);
   return isNaN(p) ? fallback : p;
 }
+
+function normalizeTimestepBiasStrategy(value) {
+  switch ((value || "none").toLowerCase()) {
+    case "content":
+    case "earlier":
+      return "earlier";
+    case "style":
+    case "later":
+      return "later";
+    case "balanced":
+    case "none":
+    default:
+      return "none";
+  }
+}
+
 function gatherConfig() {
   const unit = document.querySelector(
     'input[name="duration-unit"]:checked',
@@ -777,6 +796,9 @@ function gatherConfig() {
       // Diagnostics
       step_profile: $("cfg-step-profile").checked,
       profile_microbatch: $("cfg-profile-microbatch").checked,
+      timestep_bias_strategy: normalizeTimestepBiasStrategy(
+        $("cfg-timestep-bias-strategy").value,
+      ),
       // Progressive resolution schedule
       ...(() => {
         if (!$("cfg-progressive-reso").checked) return {};

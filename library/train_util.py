@@ -4156,6 +4156,13 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="set maximum time step for U-Net training (1~1000, default is 1000) / U-Net学習時のtime stepの最大値を設定する（1~1000で指定、省略時はデフォルト値(1000)）",
     )
     parser.add_argument(
+        "--timestep_bias_strategy",
+        type=str,
+        default="none",
+        choices=["none", "earlier", "later", "balanced", "content", "style"],
+        help="bias timestep sampling with ai-toolkit's cubic strategy: `earlier`/`content` favors lower timesteps, `later`/`style` favors higher timesteps, and `none`/`balanced` keeps uniform sampling / ai-toolkit互換の三次サンプリングでtime stepを偏らせる。`earlier`/`content`は小さいtime step寄り、`later`/`style`は大きいtime step寄り、`none`/`balanced`は一様サンプリング",
+    )
+    parser.add_argument(
         "--loss_type",
         type=str,
         default="l2",
@@ -6190,11 +6197,43 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps(min_timestep: int, max_timestep: int, b_size: int, device: torch.device) -> torch.Tensor:
+def get_timesteps(
+    min_timestep: int,
+    max_timestep: int,
+    b_size: int,
+    device: torch.device,
+    timestep_bias_strategy: str = "none",
+) -> torch.Tensor:
+    strategy_aliases = {
+        "balanced": "none",
+        "content": "earlier",
+        "earlier": "earlier",
+        "later": "later",
+        "none": "none",
+        "style": "later",
+    }
+    strategy = strategy_aliases.get(timestep_bias_strategy.lower())
+    if strategy is None:
+        raise ValueError(f"Unknown timestep bias strategy: {timestep_bias_strategy}")
+
+    if min_timestep >= max_timestep:
+        raise ValueError(
+            f"min_timestep must be less than max_timestep, got {min_timestep} >= {max_timestep}"
+        )
+
     if min_timestep < max_timestep:
-        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
-    else:
-        timesteps = torch.full((b_size,), max_timestep, device="cpu")
+        max_index = max_timestep - 1
+        if strategy == "none":
+            timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device="cpu")
+        else:
+            orig_timesteps = torch.rand((b_size,), device="cpu")
+            if strategy == "earlier":
+                biased_timesteps = orig_timesteps**3
+            else:
+                biased_timesteps = 1 - orig_timesteps**3
+
+            timestep_span = max(max_index - min_timestep, 0)
+            timesteps = (biased_timesteps * timestep_span + min_timestep).long().clamp(min_timestep, max_index)
     timesteps = timesteps.long().to(device)
     return timesteps
 
@@ -6219,7 +6258,8 @@ def get_noise_noisy_latents_and_timesteps(
     b_size = latents.shape[0]
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
     max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device)
+    timestep_bias_strategy = getattr(args, "timestep_bias_strategy", "none")
+    timesteps = get_timesteps(min_timestep, max_timestep, b_size, latents.device, timestep_bias_strategy)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
