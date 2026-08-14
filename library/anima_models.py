@@ -789,6 +789,68 @@ class PatchEmbed(nn.Module):
         return x
 
 
+# torch>=2.4 added device_type arg; older builds only have zero-arg.
+try:
+    torch.is_autocast_enabled("cuda")
+    _is_autocast_enabled_for_device = torch.is_autocast_enabled
+except TypeError:
+    def _is_autocast_enabled_for_device(device_type):  # noqa: ARG001
+        return torch.is_autocast_enabled()
+
+
+def _is_forward_patched(module: nn.Module) -> bool:
+    """True if module.forward is overridden (instance dict or subclass);
+    bypassing it with F.linear would drop e.g. LoRA deltas."""
+    if "forward" in module.__dict__:
+        return True
+    return type(module).forward is not nn.Linear.forward
+
+
+def _run_adaln_modulation_fp32(modulation: nn.Sequential, x: torch.Tensor) -> torch.Tensor:
+    """Run an AdaLN modulation Sequential, returning fp32.
+
+    Stock Linears: F.linear with fp32 weights -> real fp32 matmul. Patched
+    Linears (LoRA): go through forward to keep the delta; matmul stays fp16.
+    """
+    out = x
+    for module in modulation:
+        if isinstance(module, nn.Linear):
+            if _is_forward_patched(module):
+                out = module(out.to(module.weight.dtype))
+            else:
+                weight = module.weight.float()
+                bias = module.bias.float() if module.bias is not None else None
+                out = F.linear(out.float(), weight, bias)
+        else:
+            out = module(out)
+    return out.float()
+
+
+def _modulate_adaln(
+    modulation: nn.Sequential,
+    emb: torch.Tensor,
+    lora_addend: Optional[torch.Tensor],
+    *,
+    n_chunks: int,
+    do_fp32: bool,
+) -> Tuple[torch.Tensor, ...]:
+    """Run an AdaLN modulation, optionally in fp32, and chunk the result.
+
+    do_fp32 needs an outer autocast(fp16) to downcast back; lora_addend, if
+    given, must already match the modulation output dtype.
+    """
+    if do_fp32:
+        with torch.amp.autocast(device_type=emb.device.type, enabled=False):
+            out = _run_adaln_modulation_fp32(modulation, emb)
+            if lora_addend is not None:
+                out = out + lora_addend
+            return out.chunk(n_chunks, dim=-1)
+    out = modulation(emb)
+    if lora_addend is not None:
+        out = out + lora_addend
+    return out.chunk(n_chunks, dim=-1)
+
+
 # Final Layer
 class FinalLayer(nn.Module):
     """Final layer with AdaLN modulation + unpatchify."""
@@ -840,14 +902,22 @@ class FinalLayer(nn.Module):
         x_B_T_H_W_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ):
+        # Skip fp32 when no outer autocast; do_sample disables it and would crash.
+        do_fp32 = use_fp32 and _is_autocast_enabled_for_device(x_B_T_H_W_D.device.type)
+
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
-            shift_B_T_D, scale_B_T_D = (
-                self.adaln_modulation(emb_B_T_D) + adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
-            ).chunk(2, dim=-1)
+            lora_addend = adaln_lora_B_T_3D[:, :, : 2 * self.hidden_size]
+            if do_fp32:
+                lora_addend = lora_addend.float()
         else:
-            shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
+            lora_addend = None
+
+        shift_B_T_D, scale_B_T_D = _modulate_adaln(
+            self.adaln_modulation, emb_B_T_D, lora_addend, n_chunks=2, do_fp32=do_fp32
+        )
 
         shift_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d")
         scale_B_T_1_1_D = rearrange(scale_B_T_D, "b t d -> b t 1 1 d")
@@ -960,32 +1030,33 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ) -> torch.Tensor:
+        # fp32 promotion only when an outer autocast(fp16) is active to downcast
+        # back; do_sample disables autocast and would crash without this gate.
+        do_fp32 = use_fp32 and _is_autocast_enabled_for_device(x_B_T_H_W_D.device.type)
+
+        if do_fp32:
+            x_B_T_H_W_D = x_B_T_H_W_D.float()
+
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
-        # Compute AdaLN modulation parameters
-        # dtype pinning for fp32-upcast adaln weights (no-op otherwise)
-        x_dtype = x_B_T_H_W_D.dtype
-        emb_B_T_D = emb_B_T_D.to(self.adaln_modulation_self_attn[-1].weight.dtype)
         if self.use_adaln_lora:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
-                self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).to(x_dtype).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
-                self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).to(x_dtype).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
-                self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-            ).to(x_dtype).chunk(3, dim=-1)
+            assert adaln_lora_B_T_3D is not None
+            lora_addend = adaln_lora_B_T_3D.float() if do_fp32 else adaln_lora_B_T_3D
         else:
-            shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
-                emb_B_T_D
-            ).to(x_dtype).chunk(3, dim=-1)
-            shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
-                emb_B_T_D
-            ).to(x_dtype).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).to(x_dtype).chunk(3, dim=-1)
+            lora_addend = None
+
+        shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = _modulate_adaln(
+            self.adaln_modulation_self_attn, emb_B_T_D, lora_addend, n_chunks=3, do_fp32=do_fp32
+        )
+        shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = _modulate_adaln(
+            self.adaln_modulation_cross_attn, emb_B_T_D, lora_addend, n_chunks=3, do_fp32=do_fp32
+        )
+        shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = _modulate_adaln(
+            self.adaln_modulation_mlp, emb_B_T_D, lora_addend, n_chunks=3, do_fp32=do_fp32
+        )
 
         # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
@@ -1046,6 +1117,7 @@ class Block(nn.Module):
         rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
         adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
         extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        use_fp32: bool = False,
     ) -> torch.Tensor:
         if self.training and self.gradient_checkpointing:
             if self.unsloth_offload_checkpointing:
@@ -1054,6 +1126,7 @@ class Block(nn.Module):
                     self._forward,
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32,
                 )
             elif self.cpu_offload_checkpointing:
                 # Standard cpu offload: blocking transfers
@@ -1072,6 +1145,7 @@ class Block(nn.Module):
                     create_custom_forward(self._forward),
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32,
                     use_reentrant=False,
                 )
             else:
@@ -1080,12 +1154,14 @@ class Block(nn.Module):
                     self._forward,
                     x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                     rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                    use_fp32=use_fp32,
                     use_reentrant=False,
                 )
         else:
             return self._forward(
                 x_B_T_H_W_D, emb_B_T_D, crossattn_emb,
                 rope_emb_L_1_1_D, adaln_lora_B_T_3D, extra_per_block_pos_emb,
+                use_fp32=use_fp32,
             )
 
 
@@ -1446,6 +1522,9 @@ class MiniTrainDIT(nn.Module):
                     block_kwargs["extra_per_block_pos_emb"], _sp_group, seq_dim=2
                 )
 
+        # Only promote fp16; bf16 has range.
+        use_fp32 = x_B_T_H_W_D.dtype == torch.float16
+
         for block_idx, block in enumerate(self.blocks):
             if self.blocks_to_swap:
                 self.offloader.wait_for_block(block_idx)
@@ -1468,6 +1547,7 @@ class MiniTrainDIT(nn.Module):
                 x_B_T_H_W_D,
                 t_embedding_B_T_D,
                 crossattn_emb,
+                use_fp32=use_fp32,
                 **block_kwargs,
             )
 
@@ -1491,7 +1571,7 @@ class MiniTrainDIT(nn.Module):
             if adaln_lora_B_T_3D is not None and adaln_lora_B_T_3D.device != final_device:
                 adaln_lora_B_T_3D = adaln_lora_B_T_3D.to(final_device)
 
-        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D)
+        x_B_T_H_W_O = self.final_layer(x_B_T_H_W_D, t_embedding_B_T_D, adaln_lora_B_T_3D=adaln_lora_B_T_3D, use_fp32=use_fp32)
         x_B_C_Tt_Hp_Wp = self.unpatchify(x_B_T_H_W_O)
         return x_B_C_Tt_Hp_Wp
 
