@@ -4,28 +4,28 @@
 #   1. An import of library.muon_optimizer and a usage of its helper at runtime
 #      to construct the optimizer when --use_muon is set.
 #   2. The class is renamed to MuonAnimaTrainer for traceability.
-#   3. The optimizer-construction block (lines 540-631 of anima_train.py) is
-#      replaced with a call to library.muon_optimizer.get_optimizer().
+#   3. The optimizer-construction block is wrapped in a Muon dispatch (see the
+#      MUON-DIVERGENCE markers); the non-Muon path is verbatim upstream.
 #   4. The CLI parser is extended with --use_muon and --muon_* flags.
+#   5. muon_optimizer.gather_muon_state_before_save() runs on ALL ranks before
+#      step/epoch state saves (Muon shards momentum across DDP ranks).
+#   6. Per-group LR logging reads group names from the optimizer's param_groups
+#      instead of the hard-coded component list.
 #
 # When --use_muon is NOT passed, behavior is identical to anima_train.py. Re-merge
 # diffs from anima_train.py manually when the upstream training loop changes.
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import copy
-import json
 import math
 import os
 from library.profiler import StepProfiler
 from multiprocessing import Value
-from typing import List
 import toml
 
 from tqdm import tqdm
 
 import torch
-from library import utils
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -37,6 +37,7 @@ from library import (
     anima_models,
     anima_train_utils,
     anima_utils,
+    custom_offloading_utils,
     save_utils,
     strategy_base,
     strategy_anima,
@@ -180,7 +181,7 @@ class MuonAnimaTrainer:
     @staticmethod
     def _ensure_optimizer_param_devices_match_grads(optimizer) -> int:
         """Move swapped/offloaded params back to their grad device before optimizer.step()."""
-        moved = 0
+        moved = custom_offloading_utils.materialize_optimizer_params(optimizer)
         for group in optimizer.param_groups:
             for p in group["params"]:
                 if p is None or p.grad is None:
@@ -517,6 +518,8 @@ class MuonAnimaTrainer:
         dit.requires_grad_(train_dit)
         if train_dit and getattr(args, "freeze_inserted_only_training", False):
             freeze_summary = anima_block_freeze.apply_inserted_only_training_freeze(dit)
+            if getattr(args, 'llm_adapter_lr', None) != 0 and hasattr(dit, 'llm_adapter'):
+                dit.llm_adapter.requires_grad_(True)
             accelerator.print(
                 f"freeze_inserted_only_training: enabled for {freeze_summary['block_count']}-block Anima DiT"
             )
@@ -556,10 +559,9 @@ class MuonAnimaTrainer:
         # Setup optimizer with parameter groups
         if train_dit:
             # LLM adapter is pre-trained; freeze by default unless explicitly given a non-zero LR.
-            # Leaving it trainable causes DDP static-graph violations when batches lack t5_input_ids.
             _llm_adapter_lr = getattr(args, 'llm_adapter_lr', None)
             if _llm_adapter_lr is None:
-                _llm_adapter_lr = 0
+                _llm_adapter_lr = args.learning_rate
             param_groups = anima_train_utils.get_anima_param_groups(
                 dit,
                 base_lr=args.learning_rate,
@@ -590,10 +592,30 @@ class MuonAnimaTrainer:
         accelerator.print("prepare optimizer, data loader etc.")
 
         # ----- MUON-DIVERGENCE START -----
-        # When --use_muon is set, dispatch to the Muon+AdamW hybrid via
-        # library.muon_optimizer. Otherwise fall through to the original
-        # anima_train.py optimizer construction unchanged.
-        if muon_optimizer.is_muon_enabled(args) and train_dit and not args.blockwise_fused_optimizers and not args.fused_backward_pass:
+        # When --use_muon is set, dispatch to the Muon+AdamW hybrid. The fused
+        # flags take precedence over --use_muon (both are incompatible with
+        # Muon's need for full visibility over all 2D params for Newton-Schulz,
+        # and configs may carry a stale fused flag over from another mode):
+        # skip Muon with a loud warning instead of crashing. Under TP+SP,
+        # anima_train_tensor_sequence_parallel.py's __main__ already disables
+        # both fused flags before training starts (TP has its own landmine
+        # with them — see that file), so this branch is a no-op there; Muon
+        # itself IS supported under TP+SP via TPMuonWithAuxAdam.
+        use_muon = muon_optimizer.is_muon_enabled(args) and train_dit
+        if use_muon and (args.blockwise_fused_optimizers or args.fused_backward_pass):
+            logger.warning(
+                "--use_muon is IGNORED because --blockwise_fused_optimizers/--fused_backward_pass "
+                "is set (incompatible with Muon); training with the standard optimizer instead"
+            )
+            use_muon = False
+        # muon: upcast precision-sensitive components to fp32
+        if use_muon and getattr(args, "muon_fp32_sensitive", False):
+            if getattr(accelerator.state, "fsdp_plugin", None) is not None:
+                accelerator.print("[muon] muon_fp32_sensitive skipped: FSDP already keeps fp32 master weights")
+            else:
+                n_fp32 = muon_optimizer.upcast_sensitive_params_to_fp32(dit)
+                accelerator.print(f"[muon] muon_fp32_sensitive: upcast {n_fp32} params to fp32")
+        if use_muon:
             _muon_name, _muon_reason, optimizer = muon_optimizer.get_optimizer(
                 args,
                 trainable_params=param_groups,
@@ -674,6 +696,7 @@ class MuonAnimaTrainer:
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            worker_init_fn=train_util.dataloader_worker_init,
         )
 
         # Build raw phase DataLoaders (prepared individually after accelerator.prepare)
@@ -692,6 +715,7 @@ class MuonAnimaTrainer:
                     collate_fn=_phase_collator,
                     num_workers=n_workers,
                     persistent_workers=args.persistent_data_loader_workers,
+                    worker_init_fn=train_util.dataloader_worker_init,
                 )
             )
 
@@ -792,13 +816,20 @@ class MuonAnimaTrainer:
 
         # resume
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        if use_muon:
+            muon_optimizer.scatter_muon_state_after_load(optimizer)
+        accelerator.step = 0
 
         # Calculate starting point
         initial_step = 0
         if state_tracker["current_step"] is not None:
             initial_step = state_tracker["current_step"]
 
-        epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        _num_update_steps_per_epoch_for_resume = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        epoch_to_start = initial_step // _num_update_steps_per_epoch_for_resume
+        batches_to_skip_on_resume = (
+            (initial_step - epoch_to_start * _num_update_steps_per_epoch_for_resume) * args.gradient_accumulation_steps
+        )
         if initial_step > 0:
             assert (
                 args.max_train_steps > initial_step
@@ -871,6 +902,8 @@ class MuonAnimaTrainer:
         accelerator.print(f"  total optimization steps: {args.max_train_steps}")
 
         global_step = initial_step
+
+        train_util.freeze_gc()
 
         progress_bar = tqdm(
             range(args.max_train_steps),
@@ -955,7 +988,15 @@ class MuonAnimaTrainer:
             for m in training_models:
                 m.train()
 
-            for step, batch in enumerate(train_dataloader):
+            if epoch == epoch_to_start and batches_to_skip_on_resume > 0:
+                accelerator.print(
+                    f"  resuming mid-epoch: skipping {batches_to_skip_on_resume} already-consumed batches"
+                )
+                active_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip_on_resume)
+            else:
+                active_dataloader = train_dataloader
+
+            for step, batch in enumerate(active_dataloader):
                 current_step.value = global_step
 
                 # Resolution schedule: override batch from the appropriate phase DataLoader.
@@ -1076,7 +1117,14 @@ class MuonAnimaTrainer:
                         model_pred.float(), target.float(), args.loss_type, "none", huber_c
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        # WanVAE produces 5D latents [B,C,T,H,W] even for images (T=1).
+                        # Squeeze temporal dim so apply_masked_loss sees 4D [B,C,H,W].
+                        squeezed = loss.dim() == 5 and loss.shape[2] == 1
+                        if squeezed:
+                            loss = loss.squeeze(2)
                         loss = apply_masked_loss(loss, batch)
+                        if squeezed:
+                            loss = loss.unsqueeze(2)
                     loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
 
                     if weighting is not None:
@@ -1086,20 +1134,35 @@ class MuonAnimaTrainer:
                     loss = loss * loss_weights
                     loss = loss.mean()
 
+                    if not torch.isfinite(loss):
+                        logger.warning(
+                            f"[rank {accelerator.process_index}] non-finite loss ({loss.item()}) at step "
+                            f"{global_step}, images: {batch.get('image_keys')}"
+                        )
+
                     profiler.on_fwd_done()
                     accelerator.backward(loss)
                     profiler.on_bwd_done()
-                    self.sync_gradients(dit)
+                    clean_memory_on_device(accelerator.device)  # reclaims allocator's reserved pool every micro-batch
+                    if accelerator.sync_gradients:
+                        self.sync_gradients(dit)
                     profiler.on_comm_done()
 
                     if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
+                        skip_optimizer_step = False
                         if accelerator.sync_gradients and args.max_grad_norm != 0.0:
                             params_to_clip = []
                             for m in training_models:
                                 params_to_clip.extend(m.parameters())
-                            accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            grad_norm = accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                            if grad_norm is not None and not torch.isfinite(grad_norm):
+                                skip_optimizer_step = True
+                                logger.warning(
+                                    f"Non-finite grad norm ({grad_norm.item()}) at step {global_step}, "
+                                    f"skipping optimizer step to avoid corrupting weights."
+                                )
 
-                        if (
+                        if accelerator.sync_gradients and (
                             args.blocks_to_swap
                             or getattr(args, "cpu_offload_checkpointing", False)
                             or getattr(args, "unsloth_offload_checkpointing", False)
@@ -1112,7 +1175,8 @@ class MuonAnimaTrainer:
                                 )
                                 self._optimizer_device_fix_warned = True
 
-                        optimizer.step()
+                        if not skip_optimizer_step:
+                            optimizer.step()
                         lr_scheduler.step()
                         optimizer.zero_grad(set_to_none=True)
                     else:
@@ -1135,10 +1199,18 @@ class MuonAnimaTrainer:
                         qwen3_text_encoder, tokenize_strategy, text_encoding_strategy,
                         sample_prompts_te_outputs,
                     )
+                    clean_memory_on_device(accelerator.device)
+                    if is_swapping_blocks:
+                        accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
 
                     # Save at specific steps
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
                         accelerator.wait_for_everyone()
+                        if args.save_state:
+                            clean_memory_on_device(accelerator.device)  # scavenge headroom right before the gather's staging buffer
+                            # Collective: must run on ALL ranks, before the
+                            # main-process-only save below.
+                            muon_optimizer.gather_muon_state_before_save(optimizer)
                         self.before_save(dit)
                         if accelerator.is_main_process:
                             anima_train_utils.save_anima_model_on_epoch_end_or_stepwise(
@@ -1152,14 +1224,20 @@ class MuonAnimaTrainer:
                                 dit if train_dit else None,
                             )
                         self.after_save(dit, train_dit)
+                        clean_memory_on_device(accelerator.device)
+                        if is_swapping_blocks:
+                            accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
                     optimizer_train_fn()
 
                 current_loss = loss.detach().item()
                 if len(accelerator.trackers) > 0:
                     logs = {"loss": current_loss}
+                    if train_dit:
+                        names = [g.get("name", f"group_{i}") for i, g in enumerate(optimizer.param_groups)]
+                    else:
+                        names = []
                     train_util.append_lr_to_logs_with_names(
-                        logs, lr_scheduler, args.optimizer_type,
-                        ["base", "self_attn", "cross_attn", "mlp", "mod", "llm_adapter"] if train_dit else []
+                        logs, lr_scheduler, args.optimizer_type, names
                     )
                     accelerator.log(logs, step=global_step)
 
@@ -1179,6 +1257,9 @@ class MuonAnimaTrainer:
 
             optimizer_eval_fn()
             if args.save_every_n_epochs is not None:
+                saving_epoch = (epoch + 1) % args.save_every_n_epochs == 0 and (epoch + 1) < num_train_epochs
+                if args.save_state and saving_epoch:
+                    muon_optimizer.gather_muon_state_before_save(optimizer)
                 self.before_save(dit)
                 if accelerator.is_main_process:
                     anima_train_utils.save_anima_model_on_epoch_end_or_stepwise(
@@ -1192,12 +1273,18 @@ class MuonAnimaTrainer:
                         dit if train_dit else None,
                     )
                 self.after_save(dit, train_dit)
+                clean_memory_on_device(accelerator.device)
+                if is_swapping_blocks:
+                    accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
 
             anima_train_utils.sample_images(
                 accelerator, args, epoch + 1, global_step, dit, vae, vae_scale,
                 qwen3_text_encoder, tokenize_strategy, text_encoding_strategy,
                 sample_prompts_te_outputs,
             )
+            clean_memory_on_device(accelerator.device)
+            if is_swapping_blocks:
+                accelerator.unwrap_model(dit).prepare_block_swap_before_forward()
 
         # End training
         self.on_train_end(dit)

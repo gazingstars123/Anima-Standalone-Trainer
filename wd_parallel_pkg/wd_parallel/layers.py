@@ -334,6 +334,10 @@ class ColumnParallelLinear(nn.Module):
         self.bias   = nn.Parameter(torch.zeros(out_features)) if bias else None
         self._group: Optional[dist.ProcessGroup] = None
         self.skip_input_grad = False
+        # When True, the SP fused backward reuses the forward's all-gathered
+        # activation for the weight gradient instead of re-gathering it (one
+        # fewer collective per call). See apply.set_wgrad_gather_reuse().
+        self.reuse_fwd_gather_for_wgrad = False
 
         nn.init.kaiming_uniform_(self.weight, a=5**0.5)
 
@@ -472,7 +476,10 @@ class ColumnParallelLinear(nn.Module):
             return adapter(x)
         if self.sequence_parallel and self._group is not None and self._group.size() > 1:
             # SP path: fused async Function (backward overlaps AG/RS with matmul)
-            return _ColumnLinearFwdBwd.apply(x, self.weight, self.bias, self._group, self.seq_dim)
+            return _ColumnLinearFwdBwd.apply(
+                x, self.weight, self.bias, self._group, self.seq_dim,
+                self.reuse_fwd_gather_for_wgrad,
+            )
         # Non-SP or single-GPU: existing path (copy_to_tp_region for cross-attn KV)
         return self.forward_from_prepared_input(self._prepare_tp_input(x))
 

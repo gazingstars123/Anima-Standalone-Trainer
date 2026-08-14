@@ -1203,6 +1203,7 @@ class NetworkTrainer:
 
         # resumeする
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        accelerator.step = 0
 
         # epoch数を計算する
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1782,7 +1783,7 @@ class NetworkTrainer:
                         if hasattr(network, "update_norms"):
                             network.update_norms()
 
-                    if (
+                    if accelerator.sync_gradients and (
                         args.blocks_to_swap
                         or getattr(args, "cpu_offload_checkpointing", False)
                         or getattr(args, "unsloth_offload_checkpointing", False)

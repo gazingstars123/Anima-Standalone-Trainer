@@ -317,7 +317,8 @@ class RMSNorm(torch.nn.Module):
     @torch.amp.autocast(device_type='cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # cast back for fp32-upcast weights
+        return (output * self.weight).type_as(x)
 
 
 class GPT2FeedForward(nn.Module):
@@ -964,24 +965,27 @@ class Block(nn.Module):
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
 
         # Compute AdaLN modulation parameters
+        # dtype pinning for fp32-upcast adaln weights (no-op otherwise)
+        x_dtype = x_B_T_H_W_D.dtype
+        emb_B_T_D = emb_B_T_D.to(self.adaln_modulation_self_attn[-1].weight.dtype)
         if self.use_adaln_lora:
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = (
                 self.adaln_modulation_self_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
+            ).to(x_dtype).chunk(3, dim=-1)
             shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = (
                 self.adaln_modulation_cross_attn(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
+            ).to(x_dtype).chunk(3, dim=-1)
             shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = (
                 self.adaln_modulation_mlp(emb_B_T_D) + adaln_lora_B_T_3D
-            ).chunk(3, dim=-1)
+            ).to(x_dtype).chunk(3, dim=-1)
         else:
             shift_self_attn_B_T_D, scale_self_attn_B_T_D, gate_self_attn_B_T_D = self.adaln_modulation_self_attn(
                 emb_B_T_D
-            ).chunk(3, dim=-1)
+            ).to(x_dtype).chunk(3, dim=-1)
             shift_cross_attn_B_T_D, scale_cross_attn_B_T_D, gate_cross_attn_B_T_D = self.adaln_modulation_cross_attn(
                 emb_B_T_D
-            ).chunk(3, dim=-1)
-            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).chunk(3, dim=-1)
+            ).to(x_dtype).chunk(3, dim=-1)
+            shift_mlp_B_T_D, scale_mlp_B_T_D, gate_mlp_B_T_D = self.adaln_modulation_mlp(emb_B_T_D).to(x_dtype).chunk(3, dim=-1)
 
         # Reshape for broadcasting: (B, T, D) -> (B, T, 1, 1, D)
         shift_self_attn_B_T_1_1_D = rearrange(shift_self_attn_B_T_D, "b t d -> b t 1 1 d")
@@ -1225,6 +1229,10 @@ class MiniTrainDIT(nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
 
 
     def set_flash_attn(self, use_flash_attn: bool):
@@ -1711,6 +1719,20 @@ ANIMA_VAE_STD = [
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
 
 
+def count_blocks(state_dict_keys, prefix_string):
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    return count
+
+
 def get_dit_config(state_dict, key_prefix=''):
     """Derive DiT configuration from state_dict weight shapes."""
     dit_config = {}
@@ -1734,13 +1756,9 @@ def get_dit_config(state_dict, key_prefix=''):
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
     if dit_config["model_channels"] == 2048:
-        # The 40-layer Anima checkpoint uses interleaved block insertion, so any
-        # tensor under blocks.39.* is enough to distinguish it from the 28-layer base.
-        has_40_blocks = any(
-            key.startswith(f"{key_prefix}blocks.39.")
-            for key in state_dict.keys()
-        )
-        dit_config["num_blocks"] = 40 if has_40_blocks else 28
+        # Count blocks from the state_dict so both the 28-layer base and the
+        # 40-layer expanded checkpoint (and anything in between) are detected.
+        dit_config["num_blocks"] = count_blocks(state_dict.keys(), '{}blocks.'.format(key_prefix) + '{}.')
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
         dit_config["num_blocks"] = 36

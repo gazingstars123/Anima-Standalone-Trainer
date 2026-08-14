@@ -1,7 +1,18 @@
 # Anima full finetune training script — TP (Tensor Parallel) + SP (Sequence Parallel)
 #
-# Thin subclass of AnimaTrainer (anima_train.py).  Only the hook methods that
-# need TP/SP awareness are overridden; the full training loop is inherited.
+# TPSPTrainerMixin holds all TP/SP hook overrides and is combined with either
+# AnimaTrainer (anima_train.py, standard optimizers) or MuonAnimaTrainer
+# (anima_train_muon.py, Muon+AdamW hybrid) to produce AnimaTrainerTPSP /
+# MuonAnimaTrainerTPSP. __main__ dispatches between them based on --use_muon.
+# Only the hook methods that need TP/SP awareness are overridden; the full
+# training loop is inherited from whichever base class is selected.
+#
+# Muon under TP uses muon_optimizer.TPMuonWithAuxAdam (see library/muon_optimizer.py),
+# which all-gathers each TP-sharded weight's momentum update, runs Newton-Schulz
+# orthogonalization on the reconstructed full matrix (matching the DDP/single-GPU
+# math exactly), then re-shards the result — NOT the upstream MuonWithAuxAdam,
+# whose round-robin all_gather assumes replicated params and would corrupt
+# TP-sharded weights.
 #
 # Architecture mirrors anima_train_network_tensor_sequence_parallel.py:
 #   - TP init happens in __main__ before trainer creation (not inside a hook)
@@ -13,8 +24,9 @@
 #
 # Launch with torchrun:
 #   torchrun --nproc_per_node=2 anima_train_tensor_sequence_parallel.py --tp_degree 2 [other args]
+#   torchrun --nproc_per_node=2 anima_train_tensor_sequence_parallel.py --tp_degree 2 --use_muon [other args]
 #
-# tp_degree=1 falls back to plain AnimaTrainer (no TP init, single GPU).
+# tp_degree=1 falls back to plain AnimaTrainer/MuonAnimaTrainer (no TP init, single GPU).
 
 import argparse
 import os
@@ -41,7 +53,9 @@ except ImportError:
     logger.warning("wd_parallel not found — TP disabled. Run: pip install -r requirements.txt")
     _WDP_AVAILABLE = False
 
-from anima_train import AnimaTrainer, setup_parser as _base_setup_parser
+from anima_train import AnimaTrainer
+from anima_train_muon import MuonAnimaTrainer, setup_parser as _muon_setup_parser
+from library import muon_optimizer
 
 
 # ---------------------------------------------------------------------------
@@ -590,10 +604,100 @@ def _make_anima_tp_spec(
 
 
 # ---------------------------------------------------------------------------
-# TP-aware trainer subclass
+# TP-aware grad-norm clipping
 # ---------------------------------------------------------------------------
 
-class AnimaTrainerTPSP(AnimaTrainer):
+def _make_tp_clip_grad_norm(tp_group):
+    """Build a clip_grad_norm_ replacement that computes the global norm
+    across TP ranks instead of each rank clipping to its local shard's norm.
+
+    Ported verbatim (modulo naming) from
+    anima_train_network_tensor_sequence_parallel.py's _tp_clip_grad_norm_,
+    which is the LoRA-TP equivalent of this fix. Without this, FFT TP runs
+    with --max_grad_norm set clip each rank's sharded params by a norm that
+    only reflects that rank's slice, causing the sharded weights to diverge
+    across ranks over time.
+    """
+
+    def _tp_clip_grad_norm_(
+        parameters: Union[torch.Tensor, list],
+        max_norm: float,
+        norm_type: float = 2.0,
+    ):
+        if isinstance(parameters, torch.Tensor):
+            parameters = [parameters]
+        parameters = [p for p in parameters if p.grad is not None]
+        if len(parameters) == 0:
+            return torch.tensor(0.0)
+
+        device = parameters[0].grad.device
+        norm_type = float(norm_type)
+
+        if norm_type == float('inf'):
+            # inf norm: global max across all params and all TP ranks.
+            # Sharded params: each rank holds a slice -> need all-reduce max.
+            # Replicated params: identical on all ranks -> all-reduce max is a no-op but harmless.
+            local_max = torch.tensor(
+                max(p.grad.detach().abs().max().item() for p in parameters),
+                device=device,
+            )
+            dist.all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
+            total_norm = local_max
+        else:
+            # Lp norm: sum of p-th powers, then take p-th root.
+            #
+            # Two kinds of params must be treated differently to avoid
+            # counting the same gradient contribution multiple times:
+            #
+            #   TP-sharded (_tp_sharded=True):  each rank holds a unique shard
+            #     -> squared norms across ranks sum to the full-weight squared norm
+            #     -> must all-reduce (SUM) so every rank uses the global total.
+            #
+            #   Replicated (_tp_sharded absent/False):  every rank holds an
+            #     identical copy (sync_replicated_grads already ran).
+            #     -> simply adding all ranks' contributions would count the
+            #       same gradient tp_size times, inflating the norm by
+            #       sqrt(tp_size) and over-clipping by that factor.
+            #     -> include only locally; no cross-rank reduction needed.
+            sharded_acc = torch.zeros(1, device=device)
+            replicated_acc = torch.zeros(1, device=device)
+            for p in parameters:
+                contrib = p.grad.detach().norm(norm_type).pow(norm_type)
+                if getattr(p, '_tp_sharded', False):
+                    sharded_acc += contrib
+                else:
+                    replicated_acc += contrib
+
+            # All-reduce only the sharded contribution
+            dist.all_reduce(sharded_acc, op=dist.ReduceOp.SUM, group=tp_group)
+            total_norm = (sharded_acc + replicated_acc).pow(1.0 / norm_type)
+
+        # Clip using the global norm (identical on all ranks after all-reduce)
+        clip_coef = max_norm / (total_norm + 1e-6)
+        clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+        for p in parameters:
+            p.grad.detach().mul_(clip_coef_clamped.to(p.grad.device))
+
+        return total_norm.item()
+
+    return _tp_clip_grad_norm_
+
+
+# ---------------------------------------------------------------------------
+# TP-aware trainer mixin — shared by plain AnimaTrainer and MuonAnimaTrainer
+# ---------------------------------------------------------------------------
+
+class TPSPTrainerMixin:
+    """Hook overrides that add TP+SP support on top of either AnimaTrainer
+    (anima_train.py) or MuonAnimaTrainer (anima_train_muon.py).
+
+    Both base classes expose an identical hook surface (on_train_begin,
+    apply_model_parallelism, prepare_dit_with_accelerator, sync_gradients,
+    before_save, after_save, on_train_end, pre_process_batch — see either
+    file's docstring), so this mixin is combined with each base via
+    AnimaTrainerTPSP / MuonAnimaTrainerTPSP below rather than duplicating the
+    override bodies per optimizer.
+    """
 
     def __init__(self):
         super().__init__()
@@ -643,6 +747,17 @@ class AnimaTrainerTPSP(AnimaTrainer):
         if self.use_sp:
             dit._tp_sp_group = self.tp_groups.tp
 
+        # 7. Reuse the forward all-gather for the wgrad computation, saving one
+        # collective per trainable column-parallel layer per backward.
+        # "auto" enables it iff gradient checkpointing is on (memory-free
+        # there; without it, holding the gathered activation costs extra VRAM).
+        reuse_mode = getattr(args, 'tp_reuse_wgrad_gather', 'auto')
+        if reuse_mode == 'auto':
+            reuse_wgrad_gather = bool(getattr(args, 'gradient_checkpointing', False))
+        else:
+            reuse_wgrad_gather = reuse_mode == 'on'
+        n_reuse = wdp.set_wgrad_gather_reuse(dit, reuse_wgrad_gather)
+
         logger.info(
             f"TP sharding applied: tp_degree={self.tp_groups.tp_size}, sp={self.use_sp}, "
             f"llm_adapter={use_llm_adapter}, fuse_qkv={fuse_qkv}, "
@@ -651,15 +766,16 @@ class AnimaTrainerTPSP(AnimaTrainer):
             f"replicated_context_no_input_grad={n_no_input_grad}, "
             f"model_width={tp_geometry['model_channels']}->{tp_geometry['padded_width']}, "
             f"local_width={tp_geometry['local_width']}, local_heads={tp_geometry['local_heads']}, "
-            f"head_dim={tp_geometry['head_dim']}, padding_added={tp_geometry['padding_added']}"
+            f"head_dim={tp_geometry['head_dim']}, padding_added={tp_geometry['padding_added']}, "
+            f"reuse_wgrad_gather={reuse_wgrad_gather} (mode={reuse_mode}, {n_reuse} layers)"
         )
 
-        # 7. Optional full-model forward check
+        # 8. Optional full-model forward check
         if getattr(args, 'tp_verify_model_forward', False):
             from tp_sp_verify import run_all_checks as _tp_verify
             _tp_verify(dit=dit, network=None, groups=self.tp_groups, use_sp=self.use_sp)
 
-        # 8. NaN diagnostics
+        # 9. NaN diagnostics
         n_nan_hooks = _register_tp_nan_hooks(dit)
         logger.info(f"TP NaN diagnostic hooks registered on {n_nan_hooks} layer(s)")
 
@@ -670,6 +786,11 @@ class AnimaTrainerTPSP(AnimaTrainer):
     def prepare_dit_with_accelerator(self, accelerator, dit, is_swapping_blocks):
         if not self.tp_active:
             return super().prepare_dit_with_accelerator(accelerator, dit, is_swapping_blocks)
+
+        # Monkeypatch clip_grad_norm_ to compute the global norm across TP
+        # ranks. Without this, each rank clips TP-sharded params using only
+        # its local shard's norm, causing sharded weights to drift apart.
+        accelerator.clip_grad_norm_ = _make_tp_clip_grad_norm(self.tp_groups.tp)
 
         # TP handles its own communication — DDP wrapping would conflict.
         if is_swapping_blocks:
@@ -776,11 +897,36 @@ class AnimaTrainerTPSP(AnimaTrainer):
 
 
 # ---------------------------------------------------------------------------
-# Parser — base args + TP/SP additions
+# Concrete trainers — mixin combined with each optimizer's base trainer
+# ---------------------------------------------------------------------------
+
+class AnimaTrainerTPSP(TPSPTrainerMixin, AnimaTrainer):
+    """TP+SP with the standard optimizer path (AdamW/Prodigy/etc, no Muon)."""
+    pass
+
+
+class MuonAnimaTrainerTPSP(TPSPTrainerMixin, MuonAnimaTrainer):
+    """TP+SP with Muon+AdamW hybrid optimizer support.
+
+    The Muon side is handled entirely by muon_optimizer.TPMuonWithAuxAdam,
+    which MuonAnimaTrainer's optimizer-construction dispatch selects
+    automatically once args._tp_groups is set (see __main__ below) — no
+    override needed here beyond inheriting MuonAnimaTrainer's optimizer logic
+    alongside this mixin's TP/SP hooks.
+    """
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Parser — base + Muon args + TP/SP additions
 # ---------------------------------------------------------------------------
 
 def setup_parser() -> argparse.ArgumentParser:
-    parser = _base_setup_parser()
+    # anima_train_muon's parser is a strict superset of anima_train's (base
+    # args + --use_muon/--muon_*); building on it means this script accepts
+    # identical flags whether or not --use_muon is passed, so existing
+    # non-Muon TP configs work unchanged.
+    parser = _muon_setup_parser()
     parser.add_argument(
         "--tp_degree", type=int, default=1,
         help="Tensor Parallel degree. 1=disabled (plain single-GPU). Requires torchrun --nproc_per_node=N.",
@@ -801,6 +947,18 @@ def setup_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no_fuse_qkv", action="store_true",
         help="Disable internal fused QKV/KV projections (for debugging).",
+    )
+    parser.add_argument(
+        "--tp_reuse_wgrad_gather", type=str, default="auto",
+        choices=["auto", "on", "off"],
+        help=(
+            "Reuse the forward all-gather for the weight-gradient computation "
+            "in TP column-parallel layers instead of re-gathering in backward "
+            "(saves one collective per trainable layer per backward, ~11%% "
+            "faster in benchmarks). 'auto' (default) enables it iff "
+            "--gradient_checkpointing is set (memory-free there); 'on'/'off' "
+            "force the setting regardless of checkpointing."
+        ),
     )
     return parser
 
@@ -826,14 +984,29 @@ if __name__ == "__main__":
     train_util.verify_command_line_training_args(args)
     args = train_util.read_config_from_file(args, parser)
     tp_degree = int(getattr(args, "tp_degree", 1))
+    use_muon  = muon_optimizer.is_muon_enabled(args)
 
-    # tp_degree=1: run as plain AnimaTrainer, no TP init
+    # tp_degree=1: run as plain AnimaTrainer/MuonAnimaTrainer, no TP init
     if tp_degree <= 1:
-        AnimaTrainer().train(args)
+        (MuonAnimaTrainer() if use_muon else AnimaTrainer()).train(args)
         sys.exit(0)
 
     if not _WDP_AVAILABLE:
         raise RuntimeError("wd_parallel is required for TP but could not be imported.")
+
+    # --fused_backward_pass / --blockwise_fused_optimizers step and zero grads
+    # inside per-parameter hooks that run BEFORE sync_replicated_grads(), which
+    # would silently desync TP-replicated params (LayerNorm/AdaLN/embedders).
+    # Configs are reused across TP/DDP/FSDP/Muon runs, so warn + fall back
+    # instead of crashing on a stale flag from a different mode.
+    if getattr(args, 'fused_backward_pass', False) or getattr(args, 'blockwise_fused_optimizers', False):
+        logger.warning(
+            "--fused_backward_pass/--blockwise_fused_optimizers are incompatible with TP+SP "
+            "(they step/zero grads before sync_replicated_grads runs, silently desyncing "
+            "replicated params). Disabling both for this run."
+        )
+        args.fused_backward_pass = False
+        args.blockwise_fused_optimizers = False
 
     tp_backend = wdp.activate_backend(getattr(args, "tp_backend", "auto"))
     dist.init_process_group(backend=tp_backend)
@@ -896,8 +1069,18 @@ if __name__ == "__main__":
         return acc
     train_util.prepare_accelerator = _tp_prepare_accelerator
 
+    # Muon optimizer construction (muon_optimizer.build_anima_muon_optimizer)
+    # reads args._tp_groups to select TPMuonWithAuxAdam (exact gather-NS on
+    # TP-sharded params) instead of the DDP-oriented MuonWithAuxAdam, whose
+    # round-robin all_gather assumes replicated params and would corrupt TP
+    # shards. Force-disable Muon's own distributed all-gather path too —
+    # TPMuonWithAuxAdam handles TP communication itself.
+    if use_muon:
+        args._tp_groups = tp_groups
+        args.muon_disable_distributed_allgather = True
+
     # Create trainer and inject TP state (before trainer.train() so hooks see it)
-    trainer = AnimaTrainerTPSP()
+    trainer = (MuonAnimaTrainerTPSP() if use_muon else AnimaTrainerTPSP())
     trainer.tp_config = tp_config
     trainer.tp_groups = tp_groups
     trainer.use_sp    = use_sp

@@ -633,14 +633,6 @@ def sample_images(
     else:
         logger.info(f"[GPU {rank}] No prompts assigned (fewer prompts than GPUs), waiting...")
 
-    # Save RNG state
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    except Exception:
-        pass
-
     if my_prompts:
         # Move VAE to GPU once
         org_vae_device = next(vae.parameters()).device
@@ -706,7 +698,7 @@ def _sample_image_inference(
             return sample_prompts_te_outputs[prpt]
         if text_encoder is not None:
             tokens = tokenize_strategy.tokenize(prpt)
-            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens)
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens, enable_dropout=False)
             return encoded
         return None
 

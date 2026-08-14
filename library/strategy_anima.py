@@ -279,13 +279,16 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
 
+    _known_cache_dirs: set = set()
+
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         image_dir = os.path.dirname(image_abs_path)
         basename = os.path.splitext(os.path.basename(image_abs_path))[0]
         cache_dir = os.path.join(image_dir, "cache_text_encoder")
 
-        if self.cache_to_disk and not os.path.exists(cache_dir):
+        if self.cache_to_disk and cache_dir not in AnimaTextEncoderOutputsCachingStrategy._known_cache_dirs:
             os.makedirs(cache_dir, exist_ok=True)
+            AnimaTextEncoderOutputsCachingStrategy._known_cache_dirs.add(cache_dir)
 
         return os.path.join(cache_dir, basename + self.ANIMA_TEXT_ENCODER_OUTPUTS_SAFETENSORS_SUFFIX)
 
@@ -311,8 +314,12 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                     if "t5_attn_mask" not in keys:
                         return False
             except Exception as e:
-                logger.error(f"Error loading file: {safetensors_path}")
-                raise e
+                logger.warning(f"Error loading safetensors file {safetensors_path}, deleting and regenerating: {e}")
+                try:
+                    os.remove(safetensors_path)
+                except Exception as del_err:
+                    logger.error(f"Failed to delete corrupted file {safetensors_path}: {del_err}")
+                return False
             return True
 
         if not os.path.exists(local_npz_path):
@@ -332,8 +339,12 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             if "t5_attn_mask" not in npz:
                 return False
         except Exception as e:
-            logger.error(f"Error loading file: {local_npz_path}")
-            raise e
+            logger.warning(f"Error loading npz file {local_npz_path}, deleting and regenerating: {e}")
+            try:
+                os.remove(local_npz_path)
+            except Exception as del_err:
+                logger.error(f"Failed to delete corrupted file {local_npz_path}: {del_err}")
+            return False
 
         return True
 
@@ -425,9 +436,21 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
     def is_disk_cached_latents_expected(
         self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool
     ):
-        return self._default_is_disk_cached_latents_expected(
-            8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True
-        )
+        try:
+            return self._default_is_disk_cached_latents_expected(
+                8, bucket_reso, npz_path, flip_aug, alpha_mask, multi_resolution=True
+            )
+        except Exception as e:
+            logger.warning(f"Error checking cached latents {npz_path}, deleting and regenerating: {e}")
+            safetensors_path = os.path.splitext(npz_path)[0] + ".safetensors"
+            local_npz_path = os.path.splitext(npz_path)[0] + ".npz"
+            for file_path in [safetensors_path, local_npz_path]:
+                if os.path.exists(file_path):
+                    try:
+                        os.remove(file_path)
+                    except Exception as del_err:
+                        logger.error(f"Failed to delete corrupted file {file_path}: {del_err}")
+            return False
 
     def load_latents_from_disk(
         self, npz_path: str, bucket_reso: Tuple[int, int]

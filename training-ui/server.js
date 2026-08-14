@@ -1,5 +1,5 @@
 const express = require('express');
-const { spawn, execFileSync } = require('child_process');
+const { spawn, execFileSync, exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const TOML = require('@iarna/toml');
@@ -996,7 +996,8 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
                 const reshard = ta.fsdp2_reshard_after_forward ?? true;
                 accelerateFlags = `--use_fsdp --fsdp_version 2 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
                 accelerateFlags += ` --fsdp_reshard_after_forward ${reshard ? 'true' : 'false'}`;
-                if (ta.fsdp2_cpu_ram_efficient_loading)  accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+                accelerateFlags += ` --fsdp_cpu_ram_efficient_loading ${ta.fsdp2_cpu_ram_efficient_loading ? 'true' : 'false'}`;
+                if (ta.fsdp2_cpu_ram_efficient_loading)  accelerateFlags += ` --fsdp_sync_module_states true`;
                 if (ta.fsdp2_offload_params)             accelerateFlags += ` --fsdp_offload_params true`;
                 if (ta.fsdp2_activation_checkpointing)   accelerateFlags += ` --fsdp_activation_checkpointing true`;
                 if (ta.fsdp2_auto_wrap_policy && ta.fsdp2_auto_wrap_policy !== 'NO_WRAP') {
@@ -1012,8 +1013,8 @@ function buildLaunchConfig(gpuIds, mergedConfig, mergedConfigPath, jobArch) {
             } else if (mode === 'fsdp') {
                 accelerateFlags = `--use_fsdp --fsdp_version 1 --num_processes ${validIds.length} --mixed_precision ${mixedPrec}`;
                 accelerateFlags += ` --fsdp_sharding_strategy ${ta.fsdp_sharding_strategy || 1}`;
-                // sync_module_states must accompany cpu_ram_efficient_loading
-                if (ta.fsdp_cpu_ram_efficient_loading)   accelerateFlags += ` --fsdp_sync_module_states true --fsdp_cpu_ram_efficient_loading true`;
+                accelerateFlags += ` --fsdp_cpu_ram_efficient_loading ${ta.fsdp_cpu_ram_efficient_loading ? 'true' : 'false'}`;
+                if (ta.fsdp_cpu_ram_efficient_loading)   accelerateFlags += ` --fsdp_sync_module_states true`;
                 if (ta.fsdp_offload_params)              accelerateFlags += ` --fsdp_offload_params true`;
                 if (ta.fsdp_reshard_after_forward)       accelerateFlags += ` --fsdp_reshard_after_forward true`;
                 if (ta.fsdp_activation_checkpointing)    accelerateFlags += ` --fsdp_activation_checkpointing true`;
@@ -1315,6 +1316,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
                 const envVars = [
                     buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+                    buildEnvVar('PYTHONUNBUFFERED', '1'),
                     buildEnvVar('LOG_LEVEL', 'DEBUG'),
                     gpuEnv
                 ].filter(Boolean).join('\n');
@@ -1353,15 +1355,19 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
 
                 // Wait for server to be ready (ping loop)
                 let attempts = 0;
-                while (attempts < 60) { // 60s timeout
+                const maxAttempts = 300;
+                while (attempts < maxAttempts) {
                     await new Promise(r => setTimeout(r, 1000));
+                    if (proc.exitCode !== null) {
+                        return res.status(500).json({ error: `Persistent generation server exited early with code ${proc.exitCode}. Check log for details.` });
+                    }
                     try {
                         const ping = await fetch(`http://localhost:${port}/ping`);
                         if (ping.ok) break;
                     } catch (e) { }
                     attempts++;
                 }
-                if (attempts >= 60) {
+                if (attempts >= maxAttempts) {
                     killPersistentGen();
                     return res.status(500).json({ error: "Failed to start persistent generation server (timeout)" });
                 }
@@ -1397,6 +1403,7 @@ app.post('/api/jobs/:name/generate', async (req, res) => {
             // Standard One-Shot Logic
             const oneShotEnvVars = [
                 buildEnvVar('PYTHONIOENCODING', 'utf-8'),
+                buildEnvVar('PYTHONUNBUFFERED', '1'),
                 gpuEnv
             ].filter(Boolean).join('\n');
             const oneShotCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${genAccelerateFlags} "${genScript}" ${args.join(' ')}`;
@@ -1562,11 +1569,23 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const resolvedMode = mergedConfig.training_arguments?.multigpu_mode
             || (mergedConfig.training_arguments?.deepspeed ? 'deepspeed' : (mergedConfig.training_arguments?.use_fsdp ? 'fsdp' : 'ddp'));
 
+        if (mergedConfig.training_arguments?.use_muon) {
+            if (hasNetwork) {
+                return res.status(400).json({ error: 'Muon optimizer is only supported for full finetuning, not for LoRA training.' });
+            }
+            if (resolvedMode === 'deepspeed') {
+                return res.status(400).json({ error: 'Muon is incompatible with DeepSpeed.' });
+            }
+        }
+
         let trainCmd;
         if (resolvedMode === 'tp_sp' && tpTrainCmd) {
             trainCmd = tpTrainCmd;
         } else {
-            const scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+            let scriptName = hasNetwork ? jobArch.scripts.train_network : jobArch.scripts.train;
+            if (scriptName === 'anima_train.py' && mergedConfig.training_arguments?.use_muon) {
+                scriptName = 'anima_train_muon.py';
+            }
             const targetScript = path.join(ROOT_DIR, scriptName);
             trainCmd = `python -m accelerate.commands.launch --num_cpu_threads_per_process 1 ${accelerateFlags} "${targetScript}" --config_file="${mergedConfigPath}"`;
         }
@@ -1576,6 +1595,7 @@ app.post('/api/jobs/:name/train/start', async (req, res) => {
         const trainEnvVars = [
             buildEnvVar('PYTHONIOENCODING', 'utf-8'),
             buildEnvVar('TOKENIZERS_PARALLELISM', 'false'),
+            buildEnvVar('MALLOC_ARENA_MAX', '2'),
             gpuEnv,
             mergedConfig.training_arguments?.step_profile ? buildEnvVar('STEP_PROFILE', '1') : '',
             mergedConfig.training_arguments?.profile_microbatch ? buildEnvVar('PROFILE_MICROBATCH', '1') : '',
@@ -1734,6 +1754,13 @@ function collectImages(dir, relBase, jobName) {
             // Recurse into subdirectories (e.g. output/sample/)
             images.push(...collectImages(fullPath, path.join(relBase, entry.name), jobName));
         } else if (/\.(png|jpg|jpeg|webp)$/i.test(entry.name)) {
+            // Skip sidecar JPG files so we don't display duplicates and break the sort order
+            if (entry.name.toLowerCase().endsWith('.jpg')) {
+                const pngName = entry.name.slice(0, -4) + '.png';
+                if (fs.existsSync(path.join(dir, pngName))) {
+                    return;
+                }
+            }
             const stat = fs.statSync(fullPath);
             const relPath = path.join(relBase, entry.name).replace(/\\/g, '/');
             images.push({
@@ -1772,6 +1799,34 @@ app.get('/api/jobs/:name/samples/*', (req, res) => {
         const relativePath = req.params[0]; // everything after /samples/
         const filePath = path.join(jobPath, relativePath);
         if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+            if (filePath.toLowerCase().endsWith('.png')) {
+                const jpgPath = filePath.slice(0, -4) + '.jpg';
+                let convertNeeded = true;
+                
+                if (fs.existsSync(jpgPath)) {
+                    const pngTime = fs.statSync(filePath).mtimeMs;
+                    const jpgTime = fs.statSync(jpgPath).mtimeMs;
+                    if (jpgTime >= pngTime) {
+                        convertNeeded = false;
+                    }
+                }
+                
+                if (convertNeeded) {
+                    const cmd = `python -c "from PIL import Image; Image.open(r'''${filePath}''').convert('RGB').save(r'''${jpgPath}''', 'JPEG', quality=85)"`;
+                    exec(cmd, (error, stdout, stderr) => {
+                        if (error) {
+                            console.error(`[PNG to JPG] Conversion failed for ${filePath}:`, error);
+                            res.sendFile(filePath);
+                        } else {
+                            res.sendFile(jpgPath);
+                        }
+                    });
+                    return;
+                } else {
+                    res.sendFile(jpgPath);
+                    return;
+                }
+            }
             res.sendFile(filePath);
         } else {
             res.status(404).json({ error: 'File not found' });

@@ -119,6 +119,7 @@
                                     <option value="AdamWScheduleFree">AdamWScheduleFree</option>
                                     <option value="RAdamScheduleFree">RAdamScheduleFree</option>
                                     <option value="SGDScheduleFree">SGDScheduleFree</option>
+                                    <option value="Muon">Muon</option>
                                 </select>
                             </div>
                             <div class="form-group">
@@ -126,6 +127,7 @@
                                 <select id="cfg-lr-scheduler">
                                     <option value="cosine">Cosine</option>
                                     <option value="constant">Constant</option>
+                                    <option value="constant_with_warmup">Constant w/ Warmup</option>
                                     <option value="linear">Linear</option>
                                     <option value="cosine_with_restarts">Cosine w/ Restarts</option>
                                     <option value="cosine_with_min_lr">Cosine w/ Min LR</option>
@@ -166,6 +168,73 @@
                                 <label><input type="checkbox" id="cfg-decouple" checked> Decouple Weight Decay</label>
                                 <small>Separates weight penalty from gradient scaling to prevent
                                     overfitting when using Weight Decay.</small>
+                            </div>
+                        </div>
+
+                        <!-- Muon Settings Panel -->
+                        <div id="muon-settings-group" class="hidden" style="margin-top: 15px; margin-bottom: 15px; padding: 15px; border: 1px dashed var(--border); border-radius: 8px; background: rgba(var(--bg-rgb), 0.3);">
+                            <h5 style="margin-top: 0; margin-bottom: 12px; font-size: 0.95rem; display: flex; align-items: center; gap: 8px;">🧬 Muon Optimizer Settings</h5>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Muon LR</label>
+                                    <input type="number" id="cfg-muon-lr" value="0.02" step="0.005" min="0">
+                                    <small>Base learning rate in spectral-norm units.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Muon LR Scale</label>
+                                    <input type="number" id="cfg-muon-lr-scale" value="0.05" step="0.01" min="0">
+                                    <small>Multiplier (e.g. 0.05 * 0.02 = 1e-3 effective LR).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Muon Momentum</label>
+                                    <input type="number" id="cfg-muon-momentum" value="0.95" step="0.01" min="0" max="1">
+                                    <small>SGD-momentum beta inside Muon.</small>
+                                </div>
+                            </div>
+                            <div class="form-row" style="margin-top: 10px;">
+                                <div class="form-group">
+                                    <label>Muon Weight Decay</label>
+                                    <input type="number" id="cfg-muon-weight-decay" value="0.01" step="0.005" min="0">
+                                    <small>Weight decay for Muon 2D params.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Newton-Schulz Steps</label>
+                                    <input type="number" id="cfg-muon-ns-steps" value="5" min="1" max="10">
+                                    <small>Orthogonalization iterations (default: 5).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Param Filter Policy</label>
+                                    <select id="cfg-muon-param-filter">
+                                        <option value="self_attn_mlp_cross">self_attn_mlp_cross (Default)</option>
+                                        <option value="all_2d">all_2d</option>
+                                        <option value="custom">custom</option>
+                                    </select>
+                                    <small>Which 2D weight matrices receive Muon.</small>
+                                </div>
+                            </div>
+                            <div class="form-row" style="margin-top: 10px;">
+                                <div class="form-group">
+                                    <label>Aux AdamW LR (Optional)</label>
+                                    <input type="text" id="cfg-muon-adam-lr" placeholder="Auto" value="">
+                                    <small>Override LR for 1D/embedding params (Leave blank for auto).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Aux AdamW Betas</label>
+                                    <input type="text" id="cfg-muon-adam-betas" value="0.9,0.95" placeholder="0.9,0.95">
+                                    <small>Betas for the auxiliary AdamW optimizer.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Aux AdamW Eps</label>
+                                    <input type="number" id="cfg-muon-adam-eps" value="1e-8" step="1e-9">
+                                    <small>Epsilon for the auxiliary AdamW optimizer.</small>
+                                </div>
+                            </div>
+                            <div class="form-group" style="margin-top: 10px;">
+                                <div class="checkbox-group" style="flex-direction: column; gap: 8px; align-items: flex-start;">
+                                    <label><input type="checkbox" id="cfg-muon-disable-for-llm-adapter" checked> Force AdamW for LLM Adapter</label>
+                                    <label><input type="checkbox" id="cfg-muon-disable-distributed-allgather"> Disable Distributed Allgather (Use for FSDP2/manual; forced on automatically under TP/SP)</label>
+                                    <label><input type="checkbox" id="cfg-muon-fp32-sensitive"> Keep Sensitive Params in FP32 (adaln, q/k norms)</label>
+                                </div>
                             </div>
                         </div>
 
@@ -317,6 +386,9 @@
                             <label><input type="checkbox" id="cfg-cache-te" checked> Cache Text Encoder Outputs to
                                 Disk</label>
                             <small>Pre-encode captions. Required if text encoder is frozen.</small>
+                        </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-skip-cache-check"> Skip Cache Validity Check</label>
                         </div>
 
                         <div class="form-row">
@@ -991,7 +1063,7 @@
                             <div style="margin-top: 12px;">
                             </div>
                             <div style="margin-top: 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); font-size: 0.8rem; line-height: 1.5;">
-                                <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Sample generation during training is disabled. Backend is selected above. Torch Compile is incompatible.
+                                <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Muon (full finetune only) is supported via a TP-aware variant that all-gathers each sharded weight for Newton-Schulz orthogonalization before re-sharding, matching single-GPU/DDP Muon's math. Sample generation during training is disabled. Backend is selected above. Torch Compile is incompatible.
                             </div>
                         </div>
 
@@ -1013,6 +1085,14 @@
                         <div class="samples-header">
                             <h4>Generated Samples</h4>
                             <div class="samples-actions">
+                                <label class="samples-limit-label" for="samples-limit">Show per prompt</label>
+                                <select id="samples-limit">
+                                    <option value="5">5 most recent</option>
+                                    <option value="10" selected>10 most recent</option>
+                                    <option value="20">20 most recent</option>
+                                    <option value="50">50 most recent</option>
+                                    <option value="all">All</option>
+                                </select>
                                 <button id="btn-delete-selected" class="btn btn-danger btn-sm hidden">🗑️ Delete
                                     Selected</button>
                                 <button id="btn-refresh-samples" class="btn btn-ghost btn-sm">🔄 Refresh</button>

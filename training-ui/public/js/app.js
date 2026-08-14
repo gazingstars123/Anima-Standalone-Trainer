@@ -300,7 +300,7 @@ async function selectJob(name) {
     // Subscribe WS
     subscribeToJob(name);
     // Reset console
-    consoleOutput.textContent = "Waiting for training to start...";
+    resetConsole();
     // Reset save button
     $("btn-save").classList.add("hidden");
     $("btn-discard").classList.add("hidden");
@@ -340,7 +340,11 @@ function populateConfig(config) {
   // Training
   $("cfg-learning-rate").value = t.learning_rate || "5e-5";
   $("cfg-text-encoder-lr").value = t.text_encoder_lr || "5e-5";
-  $("cfg-optimizer").value = t.optimizer_type || "AdamW8bit";
+  if (t.use_muon) {
+    $("cfg-optimizer").value = "Muon";
+  } else {
+    $("cfg-optimizer").value = t.optimizer_type || "AdamW8bit";
+  }
   $("cfg-lr-scheduler").value = t.lr_scheduler || "cosine";
   $("cfg-lr-warmup").value = t.lr_warmup_steps ?? 100;
   $("cfg-lr-scheduler-cycles").value = t.lr_scheduler_num_cycles ?? 1;
@@ -365,6 +369,21 @@ function populateConfig(config) {
   }
   $("cfg-weight-decay").value = wdValue;
   $("cfg-decouple").checked = decoupleValue;
+
+  // Load Muon Settings
+  $("cfg-muon-lr").value = t.muon_lr ?? 0.02;
+  $("cfg-muon-lr-scale").value = t.muon_lr_scale ?? 0.05;
+  $("cfg-muon-momentum").value = t.muon_momentum ?? 0.95;
+  $("cfg-muon-weight-decay").value = t.muon_weight_decay ?? 0.01;
+  $("cfg-muon-ns-steps").value = t.muon_ns_steps ?? 5;
+  $("cfg-muon-param-filter").value = t.muon_param_filter || "self_attn_mlp_cross";
+  $("cfg-muon-adam-lr").value = t.muon_adam_lr || "";
+  $("cfg-muon-adam-betas").value = t.muon_adam_betas || "0.9,0.95";
+  $("cfg-muon-adam-eps").value = t.muon_adam_eps ?? 1e-8;
+  $("cfg-muon-disable-for-llm-adapter").checked = t.muon_disable_for_llm_adapter ?? true;
+  $("cfg-muon-disable-distributed-allgather").checked = t.muon_disable_distributed_allgather ?? false;
+  $("cfg-muon-fp32-sensitive").checked = t.muon_fp32_sensitive ?? false;
+
   // Update conditional visibility
   updateOptimizerOptions();
   updateLrSchedulerOptions();
@@ -407,6 +426,7 @@ function populateConfig(config) {
   $("cfg-cache-latents").checked = t.cache_latents_to_disk ?? true;
   $("cfg-vae-batch").value = t.vae_batch_size ?? 1;
   $("cfg-cache-te").checked = t.cache_text_encoder_outputs_to_disk ?? true;
+  $("cfg-skip-cache-check").checked = t.skip_cache_check ?? false;
   $("cfg-disable-bucket-shuffle").checked = t.disable_bucket_shuffle ?? false;
   // Progressive resolution schedule
   if (t.resolution_schedule) {
@@ -614,6 +634,23 @@ function updateOptimizerOptions() {
   const isProdigy =
     optimizer.includes("Prodigy") || optimizer.includes("DAdapt");
   $("group-decouple").classList.toggle("hidden", !isProdigy);
+
+  // Toggle Muon Settings Group
+  const isMuon = optimizer === "Muon";
+  $("muon-settings-group").classList.toggle("hidden", !isMuon);
+
+  if (isMuon) {
+    // Muon is incompatible with DeepSpeed and FSDP1 (TP/SP is supported via
+    // TPMuonWithAuxAdam)
+    const mode = $("cfg-multigpu-mode")?.value;
+    if (mode === "deepspeed" || mode === "fsdp") {
+      showToast("Muon is incompatible with DeepSpeed and FSDP1. Reverted Multi-GPU mode to DDP.", "warning");
+      if ($("cfg-multigpu-mode")) {
+        $("cfg-multigpu-mode").value = "ddp";
+        applyMultiGpuMode("ddp");
+      }
+    }
+  }
 }
 function updateLrSchedulerOptions() {
   const scheduler = $("cfg-lr-scheduler").value;
@@ -709,6 +746,21 @@ function gatherConfig() {
       text_encoder_lr: safeFloat($("cfg-text-encoder-lr").value),
       optimizer_type: $("cfg-optimizer").value,
       optimizer_args: optimizerArgs.length > 0 ? optimizerArgs : undefined,
+      // Muon configuration
+      use_muon: $("cfg-optimizer").value === "Muon",
+      muon_lr: safeFloat($("cfg-muon-lr").value),
+      muon_lr_scale: safeFloat($("cfg-muon-lr-scale").value),
+      muon_momentum: safeFloat($("cfg-muon-momentum").value),
+      muon_weight_decay: safeFloat($("cfg-muon-weight-decay").value),
+      muon_ns_steps: safeInt($("cfg-muon-ns-steps").value),
+      muon_param_filter: $("cfg-muon-param-filter").value,
+      muon_adam_lr: $("cfg-muon-adam-lr").value.trim() !== "" ? safeFloat($("cfg-muon-adam-lr").value) : undefined,
+      muon_adam_betas: $("cfg-muon-adam-betas").value.trim(),
+      muon_adam_eps: String($("cfg-muon-adam-eps").value).trim(),
+      muon_disable_for_llm_adapter: $("cfg-muon-disable-for-llm-adapter").checked,
+      muon_disable_for_adaln: true,
+      muon_disable_distributed_allgather: $("cfg-muon-disable-distributed-allgather").checked,
+      muon_fp32_sensitive: $("cfg-muon-fp32-sensitive").checked,
       lr_scheduler: $("cfg-lr-scheduler").value,
       lr_scheduler_num_cycles:
         $("cfg-lr-scheduler").value === "cosine_with_restarts"
@@ -754,6 +806,7 @@ function gatherConfig() {
       cache_latents_to_disk: $("cfg-cache-latents").checked,
       vae_batch_size: safeInt($("cfg-vae-batch").value),
       cache_text_encoder_outputs_to_disk: $("cfg-cache-te").checked,
+      skip_cache_check: $("cfg-skip-cache-check").checked,
       ...($("cfg-disable-bucket-shuffle").checked && {
         disable_bucket_shuffle: true,
       }),
@@ -830,13 +883,8 @@ function gatherConfig() {
       fsdp2_min_num_params: safeInt($("cfg-fsdp2-min-num-params").value),
       fsdp2_transformer_layer_cls_to_wrap: $("cfg-fsdp2-layer-to-wrap").value.trim(),
       // FFT options
-      ...($("cfg-training-type").value === "full_finetune" && $("cfg-freeze-llm-adapter").checked
-        ? { freeze_llm_adapter: true }
-        : {}),
-      ...($("cfg-training-type").value === "full_finetune" &&
-      $("cfg-freeze-inserted-only-training").checked
-        ? { freeze_inserted_only_training: true }
-        : {}),
+      freeze_llm_adapter: $("cfg-freeze-llm-adapter").checked,
+      freeze_inserted_only_training: $("cfg-freeze-inserted-only-training").checked,
       // HuggingFace upload
       ...($("cfg-hf-enable").checked && $("cfg-hf-repo-id").value.trim() ? {
         huggingface_repo_id: $("cfg-hf-repo-id").value.trim(),
@@ -1215,6 +1263,21 @@ function updateTrainingTypeUI(type) {
   const isLora = type === "lora";
   $("lora-config-section").classList.toggle("hidden", !isLora);
   $("fft-config-section").classList.toggle("hidden", isLora);
+
+  // Enforce Muon and LoRA restriction
+  const muonOption = Array.from($("cfg-optimizer").options).find(o => o.value === "Muon");
+  if (muonOption) {
+    if (isLora) {
+      muonOption.disabled = true;
+      if ($("cfg-optimizer").value === "Muon") {
+        $("cfg-optimizer").value = "AdamW8bit"; // fallback
+        updateOptimizerOptions();
+        showToast("Muon optimizer is not supported for LoRA training. Reverted to AdamW8bit.", "warning");
+      }
+    } else {
+      muonOption.disabled = false;
+    }
+  }
 }
 $("cfg-training-type").addEventListener("change", (e) => {
   updateTrainingTypeUI(e.target.value);
@@ -1501,43 +1564,98 @@ function loadPromptTransientSettings() {
 // ==========================================
 //  Console
 // ==========================================
-function appendConsole(text) {
-  if (!text) return;
-  if (consoleOutput.textContent.startsWith("Waiting")) {
-    consoleOutput.textContent = "";
+const CONSOLE_MAX_LINES = 3000;
+let consoleQueue = [];
+let consoleFlushScheduled = false;
+let consoleTailRaw = ""; 
+let consoleTailEl = null;
+let consoleLineCount = 0;
+
+function processCarriageReturns(segment) {
+  if (!segment.includes("\r")) return segment;
+  const pendingCR = segment.endsWith("\r");
+  const lines = segment.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    if (!lines[i].includes("\r")) continue;
+    const parts = lines[i].split("\r");
+    let out = "";
+    for (let j = 0; j < parts.length; j++) {
+      if (j === parts.length - 1) {
+        out += parts[j];
+      } else if (parts[j + 1].length > 0) {
+        out = ""; // Overwrite triggered by following content
+      } else {
+        out = parts[j]; // Keep until something actually follows the \r
+      }
+    }
+    lines[i] = out;
   }
+  return lines.join("\n") + (pendingCR ? "\r" : "");
+}
+
+function resetConsole() {
+  consoleQueue = [];
+  consoleFlushScheduled = false;
+  consoleTailRaw = "";
+  consoleTailEl = null;
+  consoleLineCount = 0;
+  if (consoleOutput) consoleOutput.textContent = "Waiting for training to start...";
+}
+
+function consoleCreateLineEl() {
+  const div = document.createElement("div");
+  consoleOutput.appendChild(div);
+  consoleLineCount++;
+  return div;
+}
+
+function consoleTrim() {
+  while (consoleLineCount > CONSOLE_MAX_LINES && consoleOutput.firstElementChild) {
+    consoleOutput.firstElementChild.remove();
+    consoleLineCount--;
+  }
+}
+
+function consoleFlush() {
+  consoleFlushScheduled = false;
+  if (!consoleOutput || !consoleQueue.length) return;
+  const newText = consoleQueue.join("");
+  consoleQueue = [];
+  // First real content after reset — clear the placeholder text node.
+  if (consoleOutput.childElementCount === 0) consoleOutput.textContent = "";
+
   const wasNearBottom =
     consoleOutput.scrollHeight -
     consoleOutput.scrollTop -
     consoleOutput.clientHeight <
     100;
-  // Standard Terminal logic: \r overwrites the CURRENT line.
-  // We split current content and process the last line surgically.
-  let fullText = consoleOutput.textContent + text;
-  if (fullText.includes("\r")) {
-    const lines = fullText.split("\n");
-    const lastLine = lines[lines.length - 1];
-    if (lastLine.includes("\r")) {
-      const parts = lastLine.split("\r");
-      let processedLine = "";
-      for (let i = 0; i < parts.length; i++) {
-        // If there is content after this \r, it overwrites what was before it.
-        // If this is the very last part of the string, we keep it.
-        if (i === parts.length - 1) {
-          processedLine += parts[i];
-        } else if (parts[i + 1].length > 0) {
-          processedLine = ""; // Overwrite triggered by following content
-        } else {
-          processedLine = parts[i]; // Keep until something actually follows the \r
-        }
-      }
-      lines[lines.length - 1] = processedLine;
-      fullText = lines.join("\n");
-    }
+
+  const processed = processCarriageReturns(consoleTailRaw + newText);
+  const parts = processed.split("\n");
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (!consoleTailEl) consoleTailEl = consoleCreateLineEl();
+    consoleTailEl.textContent = parts[i];
+    consoleTailEl = null;
   }
-  consoleOutput.textContent = fullText;
+  consoleTailRaw = parts[parts.length - 1];
+
+  const tailRenderText = consoleTailRaw.endsWith("\r") ? consoleTailRaw.slice(0, -1) : consoleTailRaw;
+  if (!consoleTailEl) consoleTailEl = consoleCreateLineEl();
+  consoleTailEl.textContent = tailRenderText;
+
+  consoleTrim();
   if (wasNearBottom) {
     consoleOutput.scrollTop = consoleOutput.scrollHeight;
+  }
+}
+
+function appendConsole(text) {
+  if (!consoleOutput || !text) return;
+  consoleQueue.push(text);
+  if (!consoleFlushScheduled) {
+    consoleFlushScheduled = true;
+    requestAnimationFrame(consoleFlush);
   }
 }
 // ==========================================
@@ -1581,9 +1699,23 @@ let sampleState = {
   groups: {}, // enum -> [images]
   allImages: [], // flat list for index lookup
   isExplicitMultiSelect: false,
+  expandedGroups: new Set(), // group keys the user chose to "show all" for
+  samplesJob: null, // job the groups/expansion state belongs to
 };
+const SAMPLES_LIMIT_OPTIONS = ["5", "10", "20", "50", "all"];
+function getSamplesLimit() {
+  const saved = localStorage.getItem("samples_limit");
+  return SAMPLES_LIMIT_OPTIONS.includes(saved) ? saved : "10";
+}
+function setSamplesLimit(value) {
+  localStorage.setItem("samples_limit", value);
+}
 async function loadSamples(isUpdate = false) {
   if (!currentJob) return;
+  if (sampleState.samplesJob !== currentJob) {
+    sampleState.samplesJob = currentJob;
+    sampleState.expandedGroups.clear();
+  }
   const images = await api(`/api/jobs/${currentJob}/samples`);
   const container = $("samples-grid");
   const empty = $("samples-empty");
@@ -1596,6 +1728,10 @@ async function loadSamples(isUpdate = false) {
   }
   empty.classList.add("hidden");
   container.classList.remove("hidden");
+  renderSampleGroups(images);
+}
+function renderSampleGroups(images) {
+  const container = $("samples-grid");
   // Load manual order from localStorage
   const savedOrder = loadManualOrder();
   const orderMap = new Map();
@@ -1619,6 +1755,8 @@ async function loadSamples(isUpdate = false) {
   });
   sampleState.groups = groups;
   sampleState.allImages = images;
+  const limitSetting = getSamplesLimit();
+  const limit = limitSetting === "all" ? Infinity : parseInt(limitSetting, 10);
   // 2. Render Groups
   container.innerHTML = "";
   const sortedGroupKeys = Object.keys(groups).sort((a, b) => {
@@ -1648,11 +1786,25 @@ async function loadSamples(isUpdate = false) {
       if (orderB) return -1;
       return b.mtime - a.mtime; // Default newest first for items without saved order
     });
-    groups[key].forEach((img) => {
+    const total = groups[key].length;
+    const expanded = sampleState.expandedGroups.has(key);
+    const visible = expanded ? groups[key] : groups[key].slice(0, limit);
+    visible.forEach((img) => {
       createSampleCard(img, gridDiv);
     });
     groupDiv.appendChild(header);
     groupDiv.appendChild(gridDiv);
+    const hiddenCount = total - visible.length;
+    if (hiddenCount > 0) {
+      const showMore = document.createElement("div");
+      showMore.className = "group-show-more";
+      showMore.textContent = `Show all (${hiddenCount} more)`;
+      showMore.addEventListener("click", () => {
+        sampleState.expandedGroups.add(key);
+        renderSampleGroups(sampleState.allImages);
+      });
+      groupDiv.appendChild(showMore);
+    }
     container.appendChild(groupDiv);
   });
   if (!window._samplesInitialized) {
@@ -1664,6 +1816,7 @@ async function loadSamples(isUpdate = false) {
 function saveManualOrder() {
   if (!currentJob) return;
   const order = [];
+  const visiblePaths = new Set();
   document.querySelectorAll(".sample-group").forEach((group) => {
     const groupKey = group.dataset.group;
     group.querySelectorAll(".sample-card").forEach((card) => {
@@ -1671,7 +1824,13 @@ function saveManualOrder() {
         path: card.dataset.path,
         group: groupKey,
       });
+      visiblePaths.add(card.dataset.path);
     });
+  });
+  // Images hidden by the per-prompt display limit aren't in the DOM;
+  // keep their previously saved placement instead of discarding it.
+  (loadManualOrder() || []).forEach((item) => {
+    if (!visiblePaths.has(item.path)) order.push(item);
   });
   localStorage.setItem(`sample_order_${currentJob}`, JSON.stringify(order));
 }
@@ -2945,6 +3104,7 @@ document.addEventListener("DOMContentLoaded", () => {
     modeSelect.addEventListener("change", (e) => {
       applyMultiGpuMode(e.target.value);
       reconcileFSDPConflicts();
+      updateOptimizerOptions();
     });
   }
   const dsOptDevice = $("cfg-ds-offload-optimizer-device");
@@ -3208,7 +3368,7 @@ $("btn-run").addEventListener("click", async () => {
     return;
   }
   updateRunningState(true);
-  consoleOutput.textContent = "";
+  resetConsole();
   if (warningMsg) appendConsole(warningMsg);
   // Auto-switch to console tab
   document.querySelector('[data-tab="console"]').click();
@@ -3283,10 +3443,21 @@ $("btn-stop").addEventListener("click", () => {
 });
 // Console clear
 $("btn-clear-console").addEventListener("click", () => {
-  consoleOutput.textContent = "Waiting for training to start...";
+  resetConsole();
 });
 // Samples refresh
 $("btn-refresh-samples").addEventListener("click", loadSamples);
+const samplesLimitSelect = $("samples-limit");
+if (samplesLimitSelect) {
+  samplesLimitSelect.value = getSamplesLimit();
+  samplesLimitSelect.addEventListener("change", () => {
+    setSamplesLimit(samplesLimitSelect.value);
+    sampleState.expandedGroups.clear();
+    if (sampleState.allImages.length > 0) {
+      renderSampleGroups(sampleState.allImages);
+    }
+  });
+}
 // TensorBoard
 $("btn-tb-launch").addEventListener("click", launchTensorBoard);
 $("btn-tb-stop").addEventListener("click", () => {
