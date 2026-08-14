@@ -1,6 +1,8 @@
 // === Anima Training UI — Client ===
 const DEFAULT_NEGATIVE_PROMPT =
   "worst quality, low quality, score_1, score_2, score_3, blurry, jpeg artifacts, sepia, low quality, worst quality, blurry, bad anatomy, extra limbs, deformed, watermark, text, signature, bareness, artifacts, hands, copyrights name, jpeg_artifacts, scan_artifacts, bad hands, missing fingers, extra digit, fewer digits, artistic error, ye-pop, deviantart, logo, patreon logo";
+const i18n = window.animaI18n;
+const tr = (key, params) => (i18n ? i18n.t(key, params) : key);
 let currentJob = null;
 let ws = null;
 let isDirty = false;
@@ -13,6 +15,9 @@ let isDraggingBg = false;
 let bgPosPercent = { x: 50, y: 50 };
 let currentSubsets = [];
 let archRegistry = null; // Loaded from /api/architectures
+let lastHwStats = null;
+let refreshHwMonitorToggle = () => {};
+let lastTbState = { running: false, url: null };
 // --- DOM Refs ---
 const $ = (id) => document.getElementById(id);
 const jobListEl = $("job-list");
@@ -41,7 +46,7 @@ async function deleteSamples(paths) {
     loadSamples();
   } catch (err) {
     console.error("Delete failed", err);
-    showToast("Error deleting samples", "danger");
+      showToast(tr("dataset.error", { message: "Failed to delete samples" }), "danger");
   }
 }
 async function api(url, opts = {}) {
@@ -111,6 +116,7 @@ function getTempClass(temp) {
   return "hw-temp-cool";
 }
 function updateHwMonitor(stats) {
+  lastHwStats = stats;
   const container = document.getElementById("hw-stats-container");
   if (!container) return;
   const cpuPct = Math.max(0, Math.min(100, stats.cpu || 0));
@@ -127,7 +133,7 @@ function updateHwMonitor(stats) {
   // System section (CPU + RAM)
   html += `<div class="hw-section">
         <div class="hw-section-header">
-            <span class="hw-section-title">System</span>
+        <span class="hw-section-title">${tr("hardware.system")}</span>
             ${cpuTempHtml}
         </div>
         <div class="hw-row">
@@ -136,7 +142,7 @@ function updateHwMonitor(stats) {
             <span class="hw-metric-value">${cpuPct}%</span>
         </div>
         <div class="hw-row">
-            <span class="hw-metric-label">RAM</span>
+            <span class="hw-metric-label">${tr("hardware.ram")}</span>
             <div class="hw-bar-wrap"><div class="hw-bar hw-bar-ram" style="width:${ramPct}%"></div></div>
             <span class="hw-metric-value">${ramPct}% &nbsp;${ramUsed} / ${ramTotal}</span>
         </div>
@@ -152,7 +158,7 @@ function updateHwMonitor(stats) {
       const tempClass = getTempClass(gpu.temp);
       const activeClass = gpu.activity ? " hw-active" : "";
       const activityBadge = gpu.activity
-        ? `<span class="hw-activity-badge">${gpu.activity}</span>`
+        ? `<span class="hw-activity-badge">${tr(`hardware.${gpu.activity}`)}</span>`
         : "";
       const powerPct = gpu.powerLimit > 0 ? Math.round((gpu.powerDraw / gpu.powerLimit) * 100) : 0;
       const powerLabel = gpu.powerLimit > 0 ? `${gpu.powerDraw}W / ${gpu.powerLimit}W` : `${gpu.powerDraw}W`;
@@ -163,17 +169,17 @@ function updateHwMonitor(stats) {
                     ${activityBadge}
                 </div>
                 <div class="hw-row">
-                    <span class="hw-metric-label">Core</span>
+                    <span class="hw-metric-label">${tr("hardware.core")}</span>
                     <div class="hw-bar-wrap"><div class="hw-bar hw-bar-gpu" style="width:${gpuPct}%"></div></div>
                     <span class="hw-metric-value">${gpuPct}%</span>
                 </div>
                 <div class="hw-row">
-                    <span class="hw-metric-label">VRAM</span>
+                    <span class="hw-metric-label">${tr("hardware.vram")}</span>
                     <div class="hw-bar-wrap"><div class="hw-bar hw-bar-vram" style="width:${vramPct}%"></div></div>
                     <span class="hw-metric-value">${vramPct}% &nbsp;${vramUsed} / ${vramTotal} GB</span>
                 </div>
                 <div class="hw-row">
-                    <span class="hw-metric-label">Power</span>
+                    <span class="hw-metric-label">${tr("hardware.power")}</span>
                     <div class="hw-bar-wrap"><div class="hw-bar hw-bar-power" style="width:${powerPct}%"></div></div>
                     <span class="hw-metric-value">${powerLabel}</span>
                 </div>
@@ -189,7 +195,7 @@ function updateHwMonitor(stats) {
             <span>${cpuPct}%${stats.cpuTemp != null ? ` · <span class="hw-temp ${getTempClass(stats.cpuTemp)}">${stats.cpuTemp}°C</span>` : ""}</span>
         </div>
         <div class="hw-compact-item">
-            <span class="hw-compact-label">RAM</span>
+            <span class="hw-compact-label">${tr("hardware.ram")}</span>
             <span>${ramUsed} / ${ramTotal}</span>
         </div>`;
     if (stats.gpus && stats.gpus.length > 0) {
@@ -199,7 +205,7 @@ function updateHwMonitor(stats) {
         const vramTotal = (gpu.memTotal / 1024).toFixed(1);
         const tempClass = getTempClass(gpu.temp);
         const badge = gpu.activity
-          ? ` <span class="hw-activity-badge">${gpu.activity}</span>`
+          ? ` <span class="hw-activity-badge">${tr(`hardware.${gpu.activity}`)}</span>`
           : "";
         ch += `<div class="hw-compact-sep"></div>
                 <div class="hw-compact-item">
@@ -218,8 +224,9 @@ function updateHwMonitor(stats) {
   if (!monitor) return;
   function syncToggleArrow(isCollapsed) {
     if (toggleBtn)
-      toggleBtn.textContent = isCollapsed ? "▲  Hardware Monitor" : "▼";
+      toggleBtn.textContent = isCollapsed ? `▲  ${tr("hardware.monitor")}` : "▼";
   }
+  refreshHwMonitorToggle = () => syncToggleArrow(monitor.classList.contains("hw-collapsed"));
   // Restore collapsed state
   const collapsed = localStorage.getItem("hw_monitor_collapsed") === "true";
   if (collapsed) monitor.classList.add("hw-collapsed");
@@ -247,7 +254,7 @@ async function loadJobs() {
   jobListEl.innerHTML = "";
   if (jobs.length === 0) {
     jobListEl.innerHTML =
-      '<div style="padding:20px;text-align:center;color:var(--text-muted)">No jobs yet</div>';
+      `<div style="padding:20px;text-align:center;color:var(--text-muted)">${tr("jobs.empty")}</div>`;
     return;
   }
   jobs.forEach((job) => {
@@ -263,7 +270,7 @@ async function loadJobs() {
 }
 async function selectJob(name) {
   if (currentJob) savePromptTransientSettings();
-  if (isDirty && !confirm("Unsaved changes. Switch anyway?")) return;
+  if (isDirty && !confirm(tr("jobs.unsavedChanges"))) return;
   isDirty = false;
   currentJob = name;
   if (samplesPollTimer) {
@@ -312,7 +319,7 @@ async function selectJob(name) {
     loadPromptTransientSettings();
   } catch (err) {
     console.error(`Failed to load job "${name}":`, err);
-    showToast(`Failed to load job: ${err.message}`, "danger");
+    showToast(tr("jobs.loadFailed", { message: err.message }), "danger");
     currentJob = null;
     localStorage.removeItem("lastJob");
     jobEditor.classList.add("hidden");
@@ -644,7 +651,7 @@ function updateOptimizerOptions() {
     // TPMuonWithAuxAdam)
     const mode = $("cfg-multigpu-mode")?.value;
     if (mode === "deepspeed" || mode === "fsdp") {
-      showToast("Muon is incompatible with DeepSpeed and FSDP1. Reverted Multi-GPU mode to DDP.", "warning");
+      showToast(tr("optimizer.muonWarning"), "warning");
       if ($("cfg-multigpu-mode")) {
         $("cfg-multigpu-mode").value = "ddp";
         applyMultiGpuMode("ddp");
@@ -1042,12 +1049,12 @@ function renderSubsets() {
     card.style.padding = isCollapsed ? "8px 15px" : "15px";
     const dirName = subset.image_dir
       ? subset.image_dir.split(/[\\/]/).pop()
-      : "Empty Path";
+      : tr("dataset.emptyPath");
     card.innerHTML = `
             <div class="prompt-card-header" style="justify-content: space-between; align-items: center; border-bottom: ${isCollapsed ? "none" : "1px solid var(--border)"}; padding-bottom: ${isCollapsed ? "0" : "8px"}; margin-bottom: ${isCollapsed ? "0" : "12px"};">
                 <div style="display: flex; align-items: center; gap: 10px; cursor: pointer; flex: 1;" class="subset-toggle">
                     <span style="font-size: 0.8rem; transition: transform 0.2s; transform: rotate(${isCollapsed ? "-90deg" : "0deg"})">▼</span>
-                    <label style="font-weight: 600; cursor: pointer;">Dataset ${idx + 1} ${subset.is_reg ? '<span style="font-size: 0.7rem; color: var(--text-muted); background: var(--border); padding: 1px 6px; border-radius: 4px; margin-left: 6px;">REG</span>' : ""}<span style="font-weight: normal; font-size: 0.8rem; color: var(--text-muted); margin-left: 10px;">${isCollapsed ? "(" + dirName + ")" : ""}</span></label>
+                    <label style="font-weight: 600; cursor: pointer;">${tr("dataset.title")} ${idx + 1} ${subset.is_reg ? '<span style="font-size: 0.7rem; color: var(--text-muted); background: var(--border); padding: 1px 6px; border-radius: 4px; margin-left: 6px;">REG</span>' : ""}<span style="font-weight: normal; font-size: 0.8rem; color: var(--text-muted); margin-left: 10px;">${isCollapsed ? "(" + dirName + ")" : ""}</span></label>
                 </div>
                 <button class="btn btn-ghost btn-sm btn-delete-subset" title="Delete Dataset" 
                     ${isLastOne ? "disabled" : ""} 
@@ -1055,59 +1062,59 @@ function renderSubsets() {
             </div>
             <div class="subset-body" style="display: ${isCollapsed ? "none" : "block"}">
                 <div class="form-group">
-                    <label style="font-size: 0.8rem;">Image Directory</label>
+                    <label style="font-size: 0.8rem;">${tr("dataset.imageDirectory")}</label>
                     <div style="display: flex; gap: 8px;">
                         <input type="text" class="sub-image-dir" value="${escapeHtml(subset.image_dir)}" placeholder="C:\\path\\to\\images" style="flex: 1;">
-                        <button class="btn btn-secondary btn-open-dir" title="Open folder">📂</button>
+                         <button class="btn btn-secondary btn-open-dir" title="${tr("dataset.openFolder")}">📂</button>
                     </div>
                 </div>
                 <div class="form-row" style="margin-top: 10px;">
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;">Num Repeats</label>
+                         <label style="font-size: 0.8rem;">${tr("dataset.numRepeats")}</label>
                         <input type="number" class="sub-num-repeats" value="${subset.num_repeats}" min="1">
                     </div>
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;">Keep Tokens</label>
+                         <label style="font-size: 0.8rem;">${tr("dataset.keepTokens")}</label>
                         <input type="number" class="sub-keep-tokens" value="${subset.keep_tokens}" min="0">
                     </div>
                 </div>
                 <div class="form-group" style="margin-top: 10px;">
-                    <label style="font-size: 0.8rem;">Caption Prefix</label>
+                     <label style="font-size: 0.8rem;">${tr("dataset.captionPrefix")}</label>
                     <input type="text" class="sub-caption-prefix" value="${escapeHtml(subset.caption_prefix)}" placeholder="e.g. A photo of,">
                 </div>
                 <div class="form-row" style="margin-top: 10px;">
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;">Caption Dropout Rate</label>
+                         <label style="font-size: 0.8rem;">${tr("dataset.captionDropout")}</label>
                         <input type="number" class="sub-caption-dropout" value="${subset.caption_dropout_rate}" step="0.01" min="0" max="1">
                     </div>
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;">Tag Dropout Rate</label>
+                         <label style="font-size: 0.8rem;">${tr("dataset.tagDropout")}</label>
                         <input type="number" class="sub-tag-dropout" value="${subset.caption_tag_dropout_rate}" step="0.01" min="0" max="1">
                     </div>
                 </div>
                 <div class="form-row" style="margin-top: 10px;">
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;">Dropout Every N Epochs</label>
+                         <label style="font-size: 0.8rem;">${tr("dataset.dropoutEvery")}</label>
                         <input type="number" class="sub-dropout-every-n" value="${subset.caption_dropout_every_n_epochs}" min="0">
-                        <small style="display:block; font-size: 0.7rem; color: var(--text-muted);">0 = disabled</small>
+                    <small style="display:block; font-size: 0.7rem; color: var(--text-muted);">${tr("dataset.disabledZero")}</small>
                     </div>
                     <div class="form-group">
                     </div>
                 </div>
                 <div class="form-row" style="margin-top: 10px;">
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-shuffle-caption" ${subset.shuffle_caption ? "checked" : ""}> Shuffle Captions</label>
+                         <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-shuffle-caption" ${subset.shuffle_caption ? "checked" : ""}> ${tr("dataset.shuffleCaptions")}</label>
                     </div>
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-flip-aug" ${subset.flip_aug ? "checked" : ""}> Flip Augmentations</label>
+                         <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-flip-aug" ${subset.flip_aug ? "checked" : ""}> ${tr("dataset.flipAugmentations")}</label>
                     </div>
                     <div class="form-group">
-                        <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-cache-info" ${subset.cache_info ? "checked" : ""}> Cache Metadata</label>
+                         <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-cache-info" ${subset.cache_info ? "checked" : ""}> ${tr("dataset.cacheMetadata")}</label>
                     </div>
                 </div>
                 <div class="form-group" style="margin-top: 10px;">
-                    <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-is-reg" ${subset.is_reg ? "checked" : ""}> Regularization Dataset</label>
-                    <small style="display:block; font-size: 0.7rem; color: var(--text-muted);">Images in this folder are used as regularization (class images) to prevent overfitting.</small>
+                     <label style="font-size: 0.8rem;"><input type="checkbox" class="sub-is-reg" ${subset.is_reg ? "checked" : ""}> ${tr("dataset.regularization")}</label>
+                    <small style="display:block; font-size: 0.7rem; color: var(--text-muted);">${tr("dataset.regularizationHint")}</small>
                 </div>
             </div>
         `;
@@ -1155,7 +1162,7 @@ function renderSubsets() {
         .addEventListener("click", async () => {
           const dir = subset.image_dir.trim();
           if (!dir) {
-            showToast("Please enter a directory path first");
+             showToast(tr("dataset.enterPathFirst"));
             return;
           }
           const result = await api("/api/system/open-folder", {
@@ -1163,7 +1170,7 @@ function renderSubsets() {
             body: { path: dir },
           });
           if (result.error) {
-            showToast("Error: " + result.error);
+            showToast(tr("dataset.error", { message: result.error }));
           }
         });
     }
@@ -1192,7 +1199,7 @@ async function saveJob() {
   const uniquePaths = new Set(subPaths);
   if (uniquePaths.size !== subPaths.length) {
     showToast(
-      "Error: Duplicate Image Directories detected. Each subset must have a unique path.",
+        tr("dataset.duplicatePaths"),
     );
     return;
   }
@@ -1209,7 +1216,7 @@ async function saveJob() {
   lastSavedPrompts = JSON.parse(JSON.stringify(currentPrompts));
   lastSavedNegativePrompt = $("global-negative-prompt").value;
   checkDirty();
-  showToast("Job saved");
+    showToast(tr("jobs.saved"));
 }
 function checkDirty() {
   if (!currentJob) return;
@@ -1238,8 +1245,8 @@ function checkDirty() {
 function discardChanges() {
   if (!currentJob || !isDirty) return;
   showConfirm(
-    "Discard Changes",
-    "Discard all unsaved changes and revert to last saved state?",
+      tr("jobs.discardChanges"),
+      tr("jobs.discardMessage"),
     () => {
       populateConfig(lastSavedConfig);
       populateDataset(lastSavedDataset);
@@ -1248,7 +1255,7 @@ function discardChanges() {
       isDirty = false;
       $("btn-save").classList.add("hidden");
       $("btn-discard").classList.add("hidden");
-      showToast("Changes discarded");
+      showToast(tr("jobs.changesDiscarded"));
     },
   );
 }
@@ -1272,7 +1279,7 @@ function updateTrainingTypeUI(type) {
       if ($("cfg-optimizer").value === "Muon") {
         $("cfg-optimizer").value = "AdamW8bit"; // fallback
         updateOptimizerOptions();
-        showToast("Muon optimizer is not supported for LoRA training. Reverted to AdamW8bit.", "warning");
+        showToast(tr("optimizer.muonLoraWarning"), "warning");
       }
     } else {
       muonOption.disabled = false;
@@ -1398,10 +1405,10 @@ function renderPrompts() {
     card.innerHTML = `
             <div class="prompt-card-header">
                 <label class="skip-label">
-                    <input type="checkbox" class="p-skip" ${p.skip ? "checked" : ""}> Skip
+                    <input type="checkbox" class="p-skip" ${p.skip ? "checked" : ""}> ${tr("prompts.skip")}
                 </label>
             </div>
-            <textarea class="p-text" rows="2" placeholder="Enter prompt text...">${escapeHtml(p.text)}</textarea>
+            <textarea class="p-text" rows="2" placeholder="${tr("prompts.placeholder")}">${escapeHtml(p.text)}</textarea>
             <div class="prompt-card-row">
                 <div class="compact-input">
                     <label>W</label>
@@ -1498,8 +1505,8 @@ function applyGlobalSettings() {
   checkDirty();
   showToast(
     d === 0
-      ? "Random seeds applied to all prompts"
-      : "Global settings applied to all prompts",
+       ? tr("prompts.randomSeedsApplied")
+       : tr("prompts.appliedToAll"),
   );
 }
 // === Prompt Tab Persistence ===
@@ -1599,7 +1606,7 @@ function resetConsole() {
   consoleTailRaw = "";
   consoleTailEl = null;
   consoleLineCount = 0;
-  if (consoleOutput) consoleOutput.textContent = "Waiting for training to start...";
+  if (consoleOutput) consoleOutput.textContent = tr("training.waiting");
 }
 
 function consoleCreateLineEl() {
@@ -1669,7 +1676,7 @@ async function loadCheckpoints() {
   const select = $("gen-lora-select");
   // Save current selection
   const currentVal = select.value;
-  select.innerHTML = '<option value="">Base Model (No LoRA)</option>';
+  select.innerHTML = `<option value="">${tr("prompts.baseModel")}</option>`;
   files.forEach((f) => {
     const opt = document.createElement("option");
     opt.value = f.path;
@@ -1703,6 +1710,15 @@ let sampleState = {
   samplesJob: null, // job the groups/expansion state belongs to
 };
 const SAMPLES_LIMIT_OPTIONS = ["5", "10", "20", "50", "all"];
+function updateSamplesLimitLabels() {
+  const select = $("samples-limit");
+  if (!select) return;
+  select.querySelectorAll("option").forEach((option) => {
+    option.textContent = option.value === "all"
+      ? tr("samples.all")
+      : tr("samples.recent", { count: option.value });
+  });
+}
 function getSamplesLimit() {
   const saved = localStorage.getItem("samples_limit");
   return SAMPLES_LIMIT_OPTIONS.includes(saved) ? saved : "10";
@@ -1771,7 +1787,7 @@ function renderSampleGroups(images) {
     const header = document.createElement("div");
     header.className = "group-header";
     header.textContent =
-      key === "default" ? "Uncategorized" : `Prompt ${parseInt(key) + 1}`;
+      key === "default" ? tr("samples.uncategorized") : `${tr("samples.prompt")} ${parseInt(key) + 1}`;
     const gridDiv = document.createElement("div");
     gridDiv.className = "group-grid";
     gridDiv.addEventListener("dragover", handleDragOver);
@@ -1798,7 +1814,7 @@ function renderSampleGroups(images) {
     if (hiddenCount > 0) {
       const showMore = document.createElement("div");
       showMore.className = "group-show-more";
-      showMore.textContent = `Show all (${hiddenCount} more)`;
+      showMore.textContent = tr("samples.showMore", { count: hiddenCount });
       showMore.addEventListener("click", () => {
         sampleState.expandedGroups.add(key);
         renderSampleGroups(sampleState.allImages);
@@ -1862,7 +1878,7 @@ function createSampleCard(img, container) {
   // Delete Card Logic
   card.querySelector(".btn-delete-card").addEventListener("click", (e) => {
     e.stopPropagation(); // Don't trigger selection/lightbox
-    showConfirm("Delete Image", `Delete "${img.name}"?`, () => {
+        showConfirm(tr("samples.deleteTitle"), tr("samples.deleteMessage", { name: img.name }), () => {
       deleteSamples([img.path]);
     });
   });
@@ -1897,8 +1913,8 @@ function initSampleInteractions() {
       const count = sampleState.selectedPaths.size;
       if (count > 0) {
         showConfirm(
-          "Delete Images",
-          `Delete ${count} selected image(s)?`,
+          tr("samples.deleteSelectedTitle"),
+          tr("samples.deleteSelectedMessage", { count }),
           () => {
             deleteSamples(Array.from(sampleState.selectedPaths));
           },
@@ -2078,7 +2094,7 @@ function updateSelectionVisuals() {
   if (btnDelete) {
     if (count > 0) {
       btnDelete.classList.remove("hidden");
-      btnDelete.textContent = `🗑️ Delete (${count})`;
+      btnDelete.textContent = tr("samples.deleteSelectedButton", { count });
     } else {
       btnDelete.classList.add("hidden");
     }
@@ -2285,7 +2301,7 @@ function openLightbox(src, name) {
         <img src="${src}">
         <div class="lightbox-metadata hidden"></div>
         <div class="lightbox-nav">
-            Use Arrow Keys to navigate | ESC to close
+            ${tr("console.openLightboxHint")}
         </div>
     `;
   // Click background to close
@@ -2366,12 +2382,13 @@ async function checkTensorBoard() {
   updateTbState(status.running, status.url);
 }
 function updateTbState(running, url) {
+  lastTbState = { running, url };
   $("btn-tb-launch").classList.toggle("hidden", running);
   $("btn-tb-stop").classList.toggle("hidden", !running);
   $("btn-tb-open").classList.toggle("hidden", !running);
   $("tb-status").textContent = running
-    ? `Running on port ${new URL(url).port}`
-    : "Not running";
+    ? tr("tensorboard.runningOnPort", { port: new URL(url).port })
+    : tr("tensorboard.notRunning");
   $("tb-status").style.color = running ? "var(--success)" : "var(--text-muted)";
   if (running && url) {
     tbUrl = url;
@@ -2391,29 +2408,29 @@ function updateTbState(running, url) {
 async function launchTensorBoard() {
   if (!currentJob) return;
   $("btn-tb-launch").disabled = true;
-  $("btn-tb-launch").textContent = "Starting...";
+  $("btn-tb-launch").textContent = tr("tensorboard.starting");
   const result = await api(`/api/jobs/${currentJob}/tensorboard`, {
     method: "POST",
   });
   if (result.error) {
     alert(result.error);
     $("btn-tb-launch").disabled = false;
-    $("btn-tb-launch").textContent = "\uD83D\uDE80 Launch";
+    $("btn-tb-launch").textContent = `\uD83D\uDE80 ${tr("tensorboard.launch")}`;
     return;
   }
   // Give TensorBoard a moment to start
   setTimeout(() => {
     updateTbState(true, result.url);
     $("btn-tb-launch").disabled = false;
-    $("btn-tb-launch").textContent = "\uD83D\uDE80 Launch";
-    showToast("TensorBoard launched");
+    $("btn-tb-launch").textContent = `\uD83D\uDE80 ${tr("tensorboard.launch")}`;
+    showToast(tr("tensorboard.launched"));
   }, 2000);
 }
 async function stopTensorBoard() {
   if (!currentJob) return;
   await api(`/api/jobs/${currentJob}/tensorboard/stop`, { method: "POST" });
   updateTbState(false, null);
-  showToast("TensorBoard stopped");
+  showToast(tr("tensorboard.stopped"));
 }
 // ==========================================
 //  Global Settings
@@ -2437,7 +2454,7 @@ function buildGlobalSettingsTabs(registry) {
     const btn = document.createElement("button");
     btn.className = "tab" + (isFirst ? " active" : "");
     btn.dataset.gtab = archId;
-    btn.textContent = arch.display_name + " Models";
+    btn.textContent = arch.display_name + tr("global.modelsSuffix");
     nav.appendChild(btn);
     // Tab pane
     const pane = document.createElement("div");
@@ -2447,8 +2464,15 @@ function buildGlobalSettingsTabs(registry) {
     for (const [configKey, pathDef] of Object.entries(arch.global_paths)) {
       const group = document.createElement("div");
       group.className = "form-group";
-      group.innerHTML = `
-                <label>${pathDef.label}</label>
+       const pathKey = `global.path.${configKey}`;
+       const pathLabel = i18n
+         ? i18n.getPathLabel(pathKey, pathDef.label)
+         : pathDef.label;
+       const pathLabelAttribute = i18n && i18n.t(pathKey) !== pathKey
+         ? ` data-i18n="${pathKey}"`
+         : "";
+       group.innerHTML = `
+                <label${pathLabelAttribute}>${pathLabel}</label>
                 <input type="text" id="cfg-global-${configKey}" placeholder="${pathDef.placeholder}">
             `;
       pane.appendChild(group);
@@ -2458,8 +2482,8 @@ function buildGlobalSettingsTabs(registry) {
       const syncGroup = document.createElement("div");
       syncGroup.style.marginTop = "8px";
       syncGroup.innerHTML = `
-                <button class="btn btn-secondary btn-sm" id="btn-sync-${archId}">\uD83D\uDD04 Use as All-in-One Checkpoint</button>
-                <small style="display: block; margin-top: 4px;">Copies the first path to all other fields for this architecture.</small>
+                <button class="btn btn-secondary btn-sm" id="btn-sync-${archId}" data-i18n="global.allInOne">\uD83D\uDD04 ${tr("global.allInOne")}</button>
+                <small data-i18n="global.allInOneHint" style="display: block; margin-top: 4px;">${tr("global.allInOneHint")}</small>
             `;
       pane.appendChild(syncGroup);
     }
@@ -2471,7 +2495,8 @@ function buildGlobalSettingsTabs(registry) {
   const appBtn = document.createElement("button");
   appBtn.className = "tab";
   appBtn.dataset.gtab = "app";
-  appBtn.textContent = "Application";
+  appBtn.textContent = tr("global.application");
+  appBtn.dataset.i18n = "global.application";
   nav.appendChild(appBtn);
   // Bind tab switching
   nav.querySelectorAll(".tab").forEach((tab) => {
@@ -2502,7 +2527,7 @@ function buildGlobalSettingsTabs(registry) {
             for (const configKey of Object.keys(arch.global_paths)) {
               $(`cfg-global-${configKey}`).value = sourceInput.value;
             }
-            showToast(`${arch.display_name} paths synced!`);
+            showToast(tr("global.pathsSynced", { name: arch.display_name }));
           }
         });
       }
@@ -2598,7 +2623,7 @@ async function saveGlobalSettings() {
   }
   await api("/api/global-config", { method: "PUT", body: config });
   closeModal("modal-global-settings");
-  showToast("Global settings saved");
+  showToast(tr("global.settingsSaved"));
 }
 // === Background Image Functions ===
 function applyBackground(
@@ -2702,7 +2727,7 @@ $("cfg-bg-upload").onchange = async (e) => {
       config.ui.blur_level = blur;
       config.ui.text_shadow_size = textShadow;
       await api("/api/global-config", { method: "PUT", body: config });
-      showToast("Background updated!");
+      showToast(tr("global.backgroundUpdated"));
     }
   };
   reader.readAsDataURL(file);
@@ -2714,7 +2739,7 @@ $("btn-remove-bg").onclick = async () => {
   const config = await api("/api/global-config");
   if (config.ui) delete config.ui.background;
   await api("/api/global-config", { method: "PUT", body: config });
-  showToast("Background removed");
+  showToast(tr("global.backgroundRemoved"));
 };
 // Slider live previews
 $("cfg-bg-dim").oninput = (e) => {
@@ -2762,11 +2787,11 @@ function showConfirm(title, message, onConfirm) {
   actions.innerHTML = "";
   const cancelBtn = document.createElement("button");
   cancelBtn.className = "btn btn-ghost";
-  cancelBtn.textContent = "Cancel";
+  cancelBtn.textContent = tr("confirm.cancel");
   cancelBtn.onclick = () => closeModal("modal-confirm");
   const confirmBtn = document.createElement("button");
   confirmBtn.className = "btn btn-danger";
-  confirmBtn.textContent = "Confirm";
+  confirmBtn.textContent = tr("confirm.confirm");
   confirmBtn.onclick = () => {
     closeModal("modal-confirm");
     onConfirm();
@@ -2776,6 +2801,7 @@ function showConfirm(title, message, onConfirm) {
   openModal("modal-confirm");
 }
 function showToast(msg) {
+  if (i18n) msg = i18n.translateText(msg);
   const toast = document.createElement("div");
   toast.style.cssText = `
         position: fixed; bottom: 20px; right: 20px; z-index: 300;
@@ -2878,7 +2904,7 @@ $("btn-create-job").addEventListener("click", async () => {
   closeModal("modal-new-job");
   await loadJobs();
   selectJob(result.name);
-  showToast("Job created");
+  showToast(tr("jobs.created"));
 });
 // Load GPUs from server
 async function loadGPUs() {
@@ -2888,7 +2914,7 @@ async function loadGPUs() {
     container.innerHTML = "";
     if (gpus.length === 0) {
       container.innerHTML =
-        "<small>No NVIDIA GPUs detected (CPU only).</small>";
+        `<small>${tr("gpu.noNvidia")}</small>`;
       return;
     }
     gpus.forEach((gpu) => {
@@ -2902,7 +2928,7 @@ async function loadGPUs() {
                 <div class="gpu-mem">${gpu.memory}</div>
                 <div class="gpu-status">
                     <div class="status-dot"></div>
-                    <span class="gpu-status-text">Idle</span>
+                    <span class="gpu-status-text">${tr("hardware.idle")}</span>
                 </div>
                 <input type="checkbox" name="gpu-select" value="${gpu.index}" checked id="gpu-${gpu.index}">
             `;
@@ -2925,7 +2951,7 @@ async function loadGPUs() {
     updateMultiGPUUI();
   } catch (err) {
     console.error("Failed to load GPUs:", err);
-    container.innerHTML = `<small style="color:red">Error: ${err.message}</small>`;
+      container.innerHTML = `<small style="color:red">${tr("gpu.error", { message: err.message })}</small>`;
   }
 }
 // Show the correct mode panel, hide the others.
@@ -3169,7 +3195,7 @@ async function loadGenGPUs() {
     const gpus = await api("/api/system/gpus");
     container.innerHTML = "";
     if (gpus.length === 0) {
-      container.innerHTML = "<small>No NVIDIA GPUs detected.</small>";
+      container.innerHTML = `<small>${tr("gpu.noNvidiaGeneration")}</small>`;
       return;
     }
     gpus.forEach((gpu, i) => {
@@ -3199,7 +3225,7 @@ async function loadGenGPUs() {
     updateGenGPULabel();
   } catch (err) {
     console.error("Failed to load gen GPUs:", err);
-    container.innerHTML = `<small style="color:red">Error: ${err.message}</small>`;
+    container.innerHTML = `<small style="color:red">${tr("gpu.error", { message: err.message })}</small>`;
   }
 }
 function getSelectedGenGPUs() {
@@ -3228,7 +3254,7 @@ function updateGenGPULabel() {
     'input[name="gen-gpu-select"]:checked',
   );
   if (selected.length > 1) {
-    label.textContent = "— Multi-GPU";
+    label.textContent = `— ${tr("hardware.multiGpu")}`;
     label.style.color = "var(--success)";
     if (optionsDiv) optionsDiv.style.display = "block";
   } else {
@@ -3249,12 +3275,12 @@ async function updateGPUActivity() {
       card.classList.remove("active-training", "active-sampling");
       if (status === "training") {
         card.classList.add("active-training");
-        textEl.textContent = "Training";
+        textEl.textContent = tr("hardware.training");
       } else if (status === "sampling") {
         card.classList.add("active-sampling");
-        textEl.textContent = "Sampling";
+        textEl.textContent = tr("hardware.sampling");
       } else {
-        textEl.textContent = "Idle";
+        textEl.textContent = tr("hardware.idle");
       }
     });
   } catch (err) {
@@ -3315,7 +3341,7 @@ $("btn-confirm-clone").addEventListener("click", async () => {
   closeModal("modal-clone-job");
   await loadJobs();
   selectJob(result.name);
-  showToast("Job cloned");
+  showToast(tr("jobs.cloned"));
 });
 // Cancel Clone
 $("btn-cancel-clone").addEventListener("click", () =>
@@ -3329,8 +3355,8 @@ $("clone-job-name").addEventListener("keydown", (e) => {
 $("btn-delete").addEventListener("click", () => {
   if (!currentJob) return;
   showConfirm(
-    "Delete Job",
-    `Delete "${currentJob}" and all its files? This cannot be undone.`,
+    tr("jobs.deleteTitle"),
+    tr("jobs.deleteMessage", { job: currentJob }),
     async () => {
       const deletedJob = currentJob;
       await api(`/api/jobs/${deletedJob}`, { method: "DELETE" });
@@ -3345,7 +3371,7 @@ $("btn-delete").addEventListener("click", () => {
       emptyState.classList.remove("hidden");
       jobEditor.classList.add("hidden");
       await loadJobs();
-      showToast("Job deleted");
+      showToast(tr("jobs.deleted"));
     },
   );
 });
@@ -3355,8 +3381,7 @@ $("btn-run").addEventListener("click", async () => {
   let warningMsg = "";
   // Check sampling Logic
   if ($("cfg-enable-sampling").checked && currentPrompts.length === 0) {
-    warningMsg =
-      "Sampling is enabled but no prompts are defined.\n\nContinue training without generating samples...\n\n";
+    warningMsg = tr("training.noPromptsWarning");
   }
   // Auto-save first
   if (isDirty) await saveJob();
@@ -3372,7 +3397,7 @@ $("btn-run").addEventListener("click", async () => {
   if (warningMsg) appendConsole(warningMsg);
   // Auto-switch to console tab
   document.querySelector('[data-tab="console"]').click();
-  showToast("Training started");
+  showToast(tr("training.started"));
 });
 // Generate
 $("btn-gen-sample").addEventListener("click", async () => {
@@ -3380,7 +3405,7 @@ $("btn-gen-sample").addEventListener("click", async () => {
   savePromptTransientSettings();
   if (isDirty) await saveJob();
   if (currentPrompts.length === 0) {
-    showToast("Add sample prompts first");
+    showToast(tr("generation.addPromptsFirst"));
     return;
   }
   const payload = {};
@@ -3407,37 +3432,37 @@ $("btn-gen-sample").addEventListener("click", async () => {
     return;
   }
   appendConsole(
-    `Starting generation...\n${loraPath ? `Using LoRA: ${loraPath} (x${payload.network_mul})` : "(Using base model)"}\nFlow Shift: ${payload.flow_shift}\n\n`,
+    `${tr("generation.starting")}\n${loraPath ? tr("generation.usingLora", { path: loraPath, strength: payload.network_mul }) : tr("generation.usingBase")}\n${tr("generation.flowShift", { value: payload.flow_shift })}\n\n`,
   );
-  showToast("Generation started");
+  showToast(tr("generation.started"));
 });
 // Unload Model
 $("btn-unload-model").addEventListener("click", async () => {
   if (!currentJob) return;
-  showToast("Unloading model...");
+  showToast(tr("generation.unloading"));
   const result = await api(`/api/jobs/${currentJob}/unload`, {
     method: "POST",
   });
   if (result.success) {
-    showToast(result.message || "Model unloaded");
+    showToast(result.message || tr("generation.unloaded"));
   } else {
     alert(result.error);
   }
 });
 $("btn-refresh-checkpoints").addEventListener("click", () => {
   loadCheckpoints();
-  showToast("Checkpoints refreshed");
+  showToast(tr("generation.checkpointsRefreshed"));
 });
 // Stop
 $("btn-stop").addEventListener("click", () => {
   if (!currentJob) return;
   showConfirm(
-    "Stop Training",
-    `Stop training for "${currentJob}"?`,
+    tr("jobs.stopTitle"),
+    tr("jobs.stopMessage", { job: currentJob }),
     async () => {
       await api(`/api/jobs/${currentJob}/train/stop`, { method: "POST" });
       updateRunningState(false);
-      showToast("Training stopped");
+      showToast(tr("training.stopped"));
     },
   );
 });
@@ -3462,8 +3487,8 @@ if (samplesLimitSelect) {
 $("btn-tb-launch").addEventListener("click", launchTensorBoard);
 $("btn-tb-stop").addEventListener("click", () => {
   showConfirm(
-    "Stop TensorBoard",
-    "Stop the TensorBoard server for this job?",
+    tr("tensorboard.stopTitle"),
+    tr("tensorboard.stopMessage"),
     stopTensorBoard,
   );
 });
@@ -3508,23 +3533,23 @@ $("btn-open-folder").addEventListener("click", async () => {
 $("btn-clear-logs").addEventListener("click", () => {
   if (!currentJob) return;
   showConfirm(
-    "Clear Logs",
-    "Delete all TensorBoard logs for this job?",
+    tr("settings.clearLogsTitle"),
+    tr("settings.clearLogsMessage"),
     async () => {
       await api(`/api/jobs/${currentJob}/clear-logs`, { method: "POST" });
-      showToast("Logs cleared");
+      showToast(tr("settings.logsCleared"));
     },
   );
 });
 $("btn-reset-config").addEventListener("click", () => {
   if (!currentJob) return;
   showConfirm(
-    "Reset Config",
-    "Reset all settings to template defaults?",
+    tr("config.resetTitle"),
+    tr("config.resetMessage"),
     async () => {
       await api(`/api/jobs/${currentJob}/reset-config`, { method: "POST" });
       selectJob(currentJob);
-      showToast("Config reset to defaults");
+      showToast(tr("config.resetDone"));
     },
   );
 });
@@ -3580,10 +3605,10 @@ function renderProgressivePhases() {
       ? existing[i].toFixed(2) : defaultFrac.toFixed(2);
 
     const hint = document.createElement("small");
-    hint.textContent = `${Math.round(parseFloat(input.value) * 100)}% of steps`;
+     hint.textContent = tr("progressive.percentOfSteps", { percent: Math.round(parseFloat(input.value) * 100) });
 
     input.addEventListener("input", () => {
-      hint.textContent = `${Math.round(parseFloat(input.value) * 100)}% of steps`;
+       hint.textContent = tr("progressive.percentOfSteps", { percent: Math.round(parseFloat(input.value) * 100) });
       updateProgressiveSum();
     });
 
@@ -3617,9 +3642,36 @@ function updateProgressiveSum() {
   const hint = $("progressive-reso-sum-hint");
   if (!hint) return;
   const ok = Math.abs(sum - 1.0) < 0.015;
-  const sumStr = `Sum: ${sum.toFixed(2)}`;
+  const sumStr = tr("progressive.sum", { sum: sum.toFixed(2) });
   // Show sum inline in the hint text with colour
-  hint.innerHTML = `Each fraction is the portion of total steps for that resolution. Must sum to 1.0. &nbsp;<span style="font-weight:600;color:${ok ? "var(--success,#4caf50)" : "var(--error,#f44336)"}">${sumStr}</span>`;
+  hint.innerHTML = `${tr("progressive.sumHint")} &nbsp;<span style="font-weight:600;color:${ok ? "var(--success,#4caf50)" : "var(--error,#f44336)"}">${sumStr}</span>`;
+}
+
+if (i18n) {
+  i18n.translateDocument();
+  updateSamplesLimitLabels();
+  $("btn-language").addEventListener("click", () => i18n.toggleLocale());
+  document.addEventListener("localechange", () => {
+    i18n.translateDocument();
+    updateSamplesLimitLabels();
+    if (lastHwStats) updateHwMonitor(lastHwStats);
+    refreshHwMonitorToggle();
+    if (currentJob) {
+      renderSubsets();
+      renderPrompts();
+      if (sampleState.allImages.length > 0) renderSampleGroups(sampleState.allImages);
+      updateGPUActivity();
+      updateTbState(lastTbState.running, lastTbState.url);
+      updateProgressiveSum();
+    }
+    if (archRegistry) {
+      const globalTabs = $("global-tabs-nav").querySelectorAll(".tab");
+      const archEntries = Object.values(archRegistry.architectures);
+      archEntries.forEach((arch, index) => {
+        if (globalTabs[index]) globalTabs[index].textContent = arch.display_name + tr("global.modelsSuffix");
+      });
+    }
+  });
 }
 
 // Toggle panel visibility and re-render phases

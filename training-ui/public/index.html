@@ -6,6 +6,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Anima LoRA Training</title>
     <link rel="stylesheet" href="css/style.css">
+    <script src="js/i18n.js"></script>
     <script>
         // FAST LOAD: Apply theme/background before rendering body to prevent flicker
         (function () {
@@ -49,7 +50,8 @@
                 <!-- Jobs rendered here -->
             </div>
             <div class="sidebar-footer">
-                <button id="btn-global-settings" class="btn btn-ghost btn-block">⚙️ Global Settings</button>
+                <button id="btn-language" class="btn btn-ghost btn-block" type="button">中文</button>
+                <button id="btn-global-settings" class="btn btn-ghost btn-block" data-i18n="global.settings">⚙️ Global Settings</button>
             </div>
         </aside>
 
@@ -68,7 +70,7 @@
                         <button id="btn-save" class="btn btn-success hidden">💾 Save</button>
                         <button id="btn-discard" class="btn btn-danger hidden">Discard</button>
                         <button id="btn-clone" class="btn btn-secondary">Clone</button>
-                        <button id="btn-run" class="btn btn-primary">▶ Train</button>
+                        <button id="btn-run" class="btn btn-primary" data-i18n="actions.train">▶ Train</button>
                         <button id="btn-stop" class="btn btn-danger hidden">⏹ Stop</button>
                         <button id="btn-delete" class="btn btn-danger" title="Delete">🗑</button>
                     </div>
@@ -1085,7 +1087,7 @@
                         <div class="samples-header">
                             <h4>Generated Samples</h4>
                             <div class="samples-actions">
-                                <label class="samples-limit-label" for="samples-limit">Show per prompt</label>
+                                <label class="samples-limit-label" for="samples-limit" data-i18n="samples.showPerPrompt">Show per prompt</label>
                                 <select id="samples-limit">
                                     <option value="5">5 most recent</option>
                                     <option value="10" selected>10 most recent</option>
@@ -1095,7 +1097,7 @@
                                 </select>
                                 <button id="btn-delete-selected" class="btn btn-danger btn-sm hidden">🗑️ Delete
                                     Selected</button>
-                                <button id="btn-refresh-samples" class="btn btn-ghost btn-sm">🔄 Refresh</button>
+                                <button id="btn-refresh-samples" class="btn btn-ghost btn-sm" data-i18n="actions.refresh">🔄 Refresh</button>
                             </div>
                         </div>
                         <div id="samples-grid" class="samples-grid">
@@ -1206,7 +1208,7 @@
     <div id="modal-global-settings" class="modal hidden">
         <div class="modal-content modal-large">
             <div class="modal-header">
-                <h3>⚙️ Global Settings</h3>
+                <h3 data-i18n="global.settings">⚙️ Global Settings</h3>
                 <button id="btn-close-global" class="btn-icon">✕</button>
             </div>
 
