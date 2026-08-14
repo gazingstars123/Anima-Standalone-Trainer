@@ -1,5 +1,5 @@
 [IMPORTANT]
-> ** Commit [ad401a8](https://github.com/gazingstars123/Anima-Standalone-Trainer/commit/ad401a86f15a7064d5cd914d1c4886cb9dc73c9b) should help stabilize distributed training on Windows. If you're still facing issues and previous fixes did not help, try setting GLOO_SOCKET_IFNAME to different networking devices**
+> ## Anima 2.9B LoRA training is supported
 
 # Anima Standalone Trainer
 
