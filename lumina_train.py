@@ -915,6 +915,9 @@ def train(args):
     save_accelerator.end_training()
     optimizer_eval_fn()
 
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()

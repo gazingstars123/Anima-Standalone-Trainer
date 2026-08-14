@@ -144,6 +144,14 @@ def add_anima_training_arguments(parser: argparse.ArgumentParser):
         action="store_true",
         help="Use Flash Attention for DiT self/cross-attention (requires flash-attn package).",
     )
+    parser.add_argument(
+        "--freeze_inserted_only_training",
+        action="store_true",
+        help=(
+            "For the 40-layer expanded Anima checkpoint, freeze inherited weights and train only the "
+            "12 inserted interleaved blocks. Requires the 40-layer checkpoint."
+        ),
+    )
 
 
 # Noise & Timestep sampling (Rectified Flow)
@@ -275,6 +283,9 @@ def get_anima_param_groups(
     llm_adapter_params = []
 
     for name, p in dit.named_parameters():
+        if not p.requires_grad:
+            continue
+
         # Store original name for debugging
         p.original_name = name
 
@@ -622,14 +633,6 @@ def sample_images(
     else:
         logger.info(f"[GPU {rank}] No prompts assigned (fewer prompts than GPUs), waiting...")
 
-    # Save RNG state
-    rng_state = torch.get_rng_state()
-    cuda_rng_state = None
-    try:
-        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    except Exception:
-        pass
-
     if my_prompts:
         # Move VAE to GPU once
         org_vae_device = next(vae.parameters()).device
@@ -695,7 +698,7 @@ def _sample_image_inference(
             return sample_prompts_te_outputs[prpt]
         if text_encoder is not None:
             tokens = tokenize_strategy.tokenize(prpt)
-            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens)
+            encoded = text_encoding_strategy.encode_tokens(tokenize_strategy, [text_encoder], tokens, enable_dropout=False)
             return encoded
         return None
 

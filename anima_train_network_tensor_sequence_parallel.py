@@ -1183,6 +1183,22 @@ if __name__ == "__main__":
         raise ValueError("--no_sequence_parallel is not supported here; this trainer intentionally runs TP+SP together")
     use_sp = True
 
+    # --fused_backward_pass / --blockwise_fused_optimizers step and zero grads
+    # inside per-parameter hooks that run BEFORE sync_replicated_grads(), which
+    # would silently desync TP-replicated params (LayerNorm/AdaLN/embedders).
+    # Configs are reused across TP/DDP/FSDP runs, so warn + fall back instead
+    # of crashing on a stale flag left over from a different mode. (This also
+    # disarms the assert_extra_args() raise for blockwise_fused_optimizers
+    # further down, since the flag is already False by the time that runs.)
+    if getattr(args, 'fused_backward_pass', False) or getattr(args, 'blockwise_fused_optimizers', False):
+        logger.warning(
+            "--fused_backward_pass/--blockwise_fused_optimizers are incompatible with TP+SP "
+            "(they step/zero grads before sync_replicated_grads runs, silently desyncing "
+            "replicated params). Disabling both for this run."
+        )
+        args.fused_backward_pass = False
+        args.blockwise_fused_optimizers = False
+
     import wd_parallel as wdp
 
     tp_backend = wdp.activate_backend(getattr(args, "tp_backend", "auto"))

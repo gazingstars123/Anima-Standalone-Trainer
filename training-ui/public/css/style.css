@@ -795,6 +795,39 @@ body {
     margin: 0 !important;
 }
 
+.samples-limit-label {
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    margin-right: 4px;
+}
+
+#samples-limit {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 4px 8px;
+    font-size: 0.85rem;
+}
+
+.group-show-more {
+    display: inline-block;
+    margin-top: 10px;
+    padding: 6px 12px;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    user-select: none;
+}
+
+.group-show-more:hover {
+    color: var(--text-primary);
+    border-color: var(--accent, var(--border));
+}
+
 /* Sample Groups */
 .sample-group {
     margin-bottom: 32px;

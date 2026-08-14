@@ -119,6 +119,7 @@
                                     <option value="AdamWScheduleFree">AdamWScheduleFree</option>
                                     <option value="RAdamScheduleFree">RAdamScheduleFree</option>
                                     <option value="SGDScheduleFree">SGDScheduleFree</option>
+                                    <option value="Muon">Muon</option>
                                 </select>
                             </div>
                             <div class="form-group">
@@ -126,6 +127,7 @@
                                 <select id="cfg-lr-scheduler">
                                     <option value="cosine">Cosine</option>
                                     <option value="constant">Constant</option>
+                                    <option value="constant_with_warmup">Constant w/ Warmup</option>
                                     <option value="linear">Linear</option>
                                     <option value="cosine_with_restarts">Cosine w/ Restarts</option>
                                     <option value="cosine_with_min_lr">Cosine w/ Min LR</option>
@@ -169,6 +171,73 @@
                             </div>
                         </div>
 
+                        <!-- Muon Settings Panel -->
+                        <div id="muon-settings-group" class="hidden" style="margin-top: 15px; margin-bottom: 15px; padding: 15px; border: 1px dashed var(--border); border-radius: 8px; background: rgba(var(--bg-rgb), 0.3);">
+                            <h5 style="margin-top: 0; margin-bottom: 12px; font-size: 0.95rem; display: flex; align-items: center; gap: 8px;">🧬 Muon Optimizer Settings</h5>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Muon LR</label>
+                                    <input type="number" id="cfg-muon-lr" value="0.02" step="0.005" min="0">
+                                    <small>Base learning rate in spectral-norm units.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Muon LR Scale</label>
+                                    <input type="number" id="cfg-muon-lr-scale" value="0.05" step="0.01" min="0">
+                                    <small>Multiplier (e.g. 0.05 * 0.02 = 1e-3 effective LR).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Muon Momentum</label>
+                                    <input type="number" id="cfg-muon-momentum" value="0.95" step="0.01" min="0" max="1">
+                                    <small>SGD-momentum beta inside Muon.</small>
+                                </div>
+                            </div>
+                            <div class="form-row" style="margin-top: 10px;">
+                                <div class="form-group">
+                                    <label>Muon Weight Decay</label>
+                                    <input type="number" id="cfg-muon-weight-decay" value="0.01" step="0.005" min="0">
+                                    <small>Weight decay for Muon 2D params.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Newton-Schulz Steps</label>
+                                    <input type="number" id="cfg-muon-ns-steps" value="5" min="1" max="10">
+                                    <small>Orthogonalization iterations (default: 5).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Param Filter Policy</label>
+                                    <select id="cfg-muon-param-filter">
+                                        <option value="self_attn_mlp_cross">self_attn_mlp_cross (Default)</option>
+                                        <option value="all_2d">all_2d</option>
+                                        <option value="custom">custom</option>
+                                    </select>
+                                    <small>Which 2D weight matrices receive Muon.</small>
+                                </div>
+                            </div>
+                            <div class="form-row" style="margin-top: 10px;">
+                                <div class="form-group">
+                                    <label>Aux AdamW LR (Optional)</label>
+                                    <input type="text" id="cfg-muon-adam-lr" placeholder="Auto" value="">
+                                    <small>Override LR for 1D/embedding params (Leave blank for auto).</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Aux AdamW Betas</label>
+                                    <input type="text" id="cfg-muon-adam-betas" value="0.9,0.95" placeholder="0.9,0.95">
+                                    <small>Betas for the auxiliary AdamW optimizer.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Aux AdamW Eps</label>
+                                    <input type="number" id="cfg-muon-adam-eps" value="1e-8" step="1e-9">
+                                    <small>Epsilon for the auxiliary AdamW optimizer.</small>
+                                </div>
+                            </div>
+                            <div class="form-group" style="margin-top: 10px;">
+                                <div class="checkbox-group" style="flex-direction: column; gap: 8px; align-items: flex-start;">
+                                    <label><input type="checkbox" id="cfg-muon-disable-for-llm-adapter" checked> Force AdamW for LLM Adapter</label>
+                                    <label><input type="checkbox" id="cfg-muon-disable-distributed-allgather"> Disable Distributed Allgather (Use for FSDP2/manual; forced on automatically under TP/SP)</label>
+                                    <label><input type="checkbox" id="cfg-muon-fp32-sensitive"> Keep Sensitive Params in FP32 (adaln, q/k norms)</label>
+                                </div>
+                            </div>
+                        </div>
+
                         <h4>Training Schedule</h4>
                         <div class="form-group">
                             <label>Duration Unit</label>
@@ -189,6 +258,14 @@
                                     <label>Save Every N Epochs</label>
                                     <input type="number" id="cfg-save-every" value="1" min="1">
                                 </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Epochs</label>
+                                    <input type="number" id="cfg-save-last-n-epochs" value="0" min="0" title="0 = keep all">
+                                </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Save States Folders</label>
+                                    <input type="number" id="cfg-keep-last-n-states-epochs" value="1" min="0" title="0 = keep all states">
+                                </div>
                             </div>
                         </div>
 
@@ -203,10 +280,16 @@
                                     <label>Save Every N Steps</label>
                                     <input type="number" id="cfg-save-every-steps" value="500" min="1">
                                 </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Steps</label>
+                                    <input type="number" id="cfg-save-last-n-steps" value="0" min="0" title="0 = keep all">
+                                </div>
+                                <div class="form-group">
+                                    <label>Keep Last N Save States Folders</label>
+                                    <input type="number" id="cfg-keep-last-n-states-steps" value="1" min="0" title="0 = keep all states">
+                                </div>
                             </div>
                         </div>
-
-
 
                         <div class="form-row">
                             <div class="form-group">
@@ -304,6 +387,9 @@
                                 Disk</label>
                             <small>Pre-encode captions. Required if text encoder is frozen.</small>
                         </div>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-skip-cache-check"> Skip Cache Validity Check</label>
+                        </div>
 
                         <div class="form-row">
                             <div class="form-group">
@@ -395,6 +481,37 @@
                             <small>Keeps DataLoader order within resolution buckets.</small>
                         </div>
 
+                        <h4>Validation</h4>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-enable-validation"> Enable Loss Validation</label>
+                            <small>Holds out a portion of training data to compute validation loss. Only available with LoRA.</small>
+                        </div>
+                        <div id="group-validation" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); margin-top: 10px; display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Validation Split</label>
+                                    <input type="number" id="cfg-validation-split" value="0.1" min="0.01" max="0.5" step="0.01">
+                                </div>
+                                <div class="form-group">
+                                    <label>Validation Seed</label>
+                                    <input type="number" id="cfg-validation-seed" value="42">
+                                </div>
+                            </div>
+                            <div class="form-group" id="container-validate-every-epochs">
+                                <label>Validate Every N Epochs</label>
+                                <input type="number" id="cfg-validate-every-epochs" value="1" min="1">
+                            </div>
+                            <div class="form-group hidden" id="container-validate-every-steps">
+                                <label>Validate Every N Steps</label>
+                                <input type="number" id="cfg-validate-every-steps" value="500" min="1">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Validation Steps</label>
+                                <input type="number" id="cfg-max-validation-steps" value="10" min="1">
+                                <small>Max batches (= batch size) per validation run.</small>
+                            </div>
+                        </div>
+
                         <div
                             style="display: flex; justify-content: space-between; align-items: center; margin-top: 24px;">
                             <h4>Dataset Folders</h4>
@@ -466,7 +583,11 @@
                             <h4>Full Finetune Options</h4>
                             <div class="form-group">
                                 <label><input type="checkbox" id="cfg-freeze-llm-adapter" checked> Freeze LLM Adapter</label>
-                                <small>Keep the LLM adapter weights frozen during training. Recommended — the adapter is pre-trained and retraining it risks degrading text understanding and causes DDP graph errors.</small>
+                                <small>Keep the LLM adapter weights frozen during training.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-freeze-inserted-only-training"> Train Inserted 12 Blocks Only</label>
+                                <small>For the 40-layer expanded Anima checkpoint, freeze inherited weights and train only the interleaved inserted blocks. To continue with all 40 blocks, start a new run from a saved model checkpoint with this option turned off.</small>
                             </div>
                         </div>
 
@@ -479,6 +600,55 @@
                             <label>Resume State Folder</label>
                             <input type="text" id="cfg-resume" placeholder="C:\path\to\saved_state">
                             <small>Resume training state (optimizer, scheduler, step count). Leave blank when auto-resume is enabled.</small>
+                        </div>
+
+                        <h4>HuggingFace</h4>
+                        <div class="form-group">
+                            <label><input type="checkbox" id="cfg-hf-enable"> Upload checkpoints to HuggingFace</label>
+                            <small>Automatically push saved checkpoints to a HuggingFace model repo after each save.</small>
+                        </div>
+                        <div id="group-hf" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); margin-top: 10px; display: flex; flex-direction: column; gap: 12px;">
+                            <div class="form-group">
+                                <label>Repo ID</label>
+                                <input type="text" id="cfg-hf-repo-id" placeholder="username/model-name">
+                            </div>
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label>Path in Repo</label>
+                                    <input type="text" id="cfg-hf-path-in-repo" placeholder="checkpoints/">
+                                    <small>Optional subfolder inside the repo.</small>
+                                </div>
+                                <div class="form-group">
+                                    <label>Visibility</label>
+                                    <select id="cfg-hf-visibility">
+                                        <option value="private">Private</option>
+                                        <option value="public">Public</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-save-state"> Include optimizer state</label>
+                                <small>Also uploads training state. Useful for resuming from HuggingFace.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-async" checked> Async upload</label>
+                                <small>Upload in background — training continues without waiting.</small>
+                            </div>
+                            <div class="form-group">
+                                <label><input type="checkbox" id="cfg-hf-resume-enable"> Resume from HuggingFace</label>
+                                <small>Download and resume a saved training state from a HuggingFace repo.</small>
+                            </div>
+                            <div id="group-hf-resume" class="hidden" style="padding-left: 16px; border-left: 2px solid var(--border); display: flex; flex-direction: column; gap: 8px;">
+                                <div class="form-group">
+                                    <label>Resume Path</label>
+                                    <input type="text" id="cfg-hf-resume-path" placeholder="username/repo/checkpoints/state-epoch-5">
+                                    <small>Format: <code>repo_id/path/to/state</code> or <code>repo_id/path:revision:repo_type</code></small>
+                                </div>
+                            </div>
+                            <div class="form-group">
+                                <label>HF Token <span style="opacity:0.5">(optional — prefer HUGGING_FACE_HUB_TOKEN env var)</span></label>
+                                <input type="password" id="cfg-hf-token" placeholder="hf_...">
+                            </div>
                         </div>
                     </div>
 
@@ -661,6 +831,13 @@
                             <div style="margin-top: 12px;">
                                 <label title="Tells DDP the computation graph is identical every step (same layers, same order). Enables more aggressive comm/compute overlap. Safe for standard UNet/DiT architectures."><input type="checkbox" id="cfg-ddp-static-graph"> Static Graph</label>
                                 <small>Allows DDP to overlap communication and computation more aggressively. Recommended when model structure does not change between steps.</small>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label><input type="checkbox" id="cfg-ddp-find-unused-parameters" checked> Find Unused Parameters</label>
+                            </div>
+                            <div style="margin-top: 12px;">
+                                <label>Bucket Cap (MB)</label>
+                                <input type="number" id="cfg-ddp-bucket-cap-mb" value="25" min="1">
                             </div>
                         </div>
 
@@ -886,7 +1063,7 @@
                             <div style="margin-top: 12px;">
                             </div>
                             <div style="margin-top: 12px; padding: 10px; background: var(--bg-secondary); border-radius: 4px; border-left: 3px solid var(--accent); font-size: 0.8rem; line-height: 1.5;">
-                                <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Sample generation during training is disabled. Backend is selected above. Torch Compile is incompatible.
+                                <strong>TP/SP notes:</strong> All standard training configs (LR, batch size, optimizer, network dim, etc.) work. Muon (full finetune only) is supported via a TP-aware variant that all-gathers each sharded weight for Newton-Schulz orthogonalization before re-sharding, matching single-GPU/DDP Muon's math. Sample generation during training is disabled. Backend is selected above. Torch Compile is incompatible.
                             </div>
                         </div>
 
@@ -908,6 +1085,14 @@
                         <div class="samples-header">
                             <h4>Generated Samples</h4>
                             <div class="samples-actions">
+                                <label class="samples-limit-label" for="samples-limit">Show per prompt</label>
+                                <select id="samples-limit">
+                                    <option value="5">5 most recent</option>
+                                    <option value="10" selected>10 most recent</option>
+                                    <option value="20">20 most recent</option>
+                                    <option value="50">50 most recent</option>
+                                    <option value="all">All</option>
+                                </select>
                                 <button id="btn-delete-selected" class="btn btn-danger btn-sm hidden">🗑️ Delete
                                     Selected</button>
                                 <button id="btn-refresh-samples" class="btn btn-ghost btn-sm">🔄 Refresh</button>

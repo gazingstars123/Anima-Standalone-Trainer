@@ -23,7 +23,26 @@ persistent_data_loader_workers = true
 seed = 42
 cache_latents_to_disk = true
 cache_text_encoder_outputs_to_disk = true
+skip_cache_check = false
 sample_every_n_epochs = 1
+freeze_llm_adapter = true
+freeze_inserted_only_training = false
+
+# Muon Defaults
+use_muon = false
+muon_lr = 0.02
+muon_lr_scale = 0.05
+muon_momentum = 0.95
+muon_weight_decay = 0.01
+muon_ns_steps = 5
+muon_adam_betas = "0.9,0.95"
+muon_adam_eps = "1e-8"
+muon_param_filter = "self_attn_mlp_cross"
+muon_disable_for_llm_adapter = true
+muon_disable_for_adaln = true
+muon_disable_distributed_allgather = false
+muon_fp32_sensitive = false
+
 
 [network_arguments]
 network_module = "networks.lora_anima"

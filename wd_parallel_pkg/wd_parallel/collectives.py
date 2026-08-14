@@ -548,11 +548,18 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
 
     When weight.requires_grad is False (frozen base in LoRA training):
       steps 1/4/5 are skipped — only 2/3/6.
+
+    save_gathered: when True (and weight.requires_grad and group.size()>1),
+      forward saves the already-gathered full-sequence activation instead of
+      the SP shard, so backward reuses it for wgrad instead of re-running the
+      AG from step 1. Removes one collective per call at the cost of holding
+      the full-sequence activation across the backward (bounded — callers
+      should only enable this under gradient checkpointing, where that
+      activation is about to be recomputed/freed anyway).
     """
 
     @staticmethod
-    def forward(ctx, input_, weight, bias, group, seq_dim):
-        ctx.save_for_backward(input_, weight)
+    def forward(ctx, input_, weight, bias, group, seq_dim, save_gathered=False):
         ctx.group            = group
         ctx.seq_dim          = seq_dim
         ctx.use_bias         = bias is not None
@@ -564,13 +571,23 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
         else:
             gathered = input_
 
+        reused_gather = (
+            bool(save_gathered)
+            and ctx.weight_needs_grad
+            and group is not None
+            and group.size() > 1
+        )
+        ctx.reused_gather = reused_gather
+        ctx.save_for_backward(gathered if reused_gather else input_, weight)
+
         return torch.nn.functional.linear(gathered, weight, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
-        input_, weight = ctx.saved_tensors
+        saved, weight = ctx.saved_tensors
         group   = ctx.group
         seq_dim = ctx.seq_dim
+        reused  = ctx.reused_gather
 
         # Cast grad to weight dtype — weight.dtype is authoritative for matmul ops.
         # ctx.input_dtype may be fp32 when AMP autocast upcasts activations, while
@@ -583,8 +600,9 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
 
         # Step 1: async AG of saved input shard (for wgrad) — launch before grad_input matmul
         # CUDA_DEVICE_MAX_CONNECTIONS=1 ensures AG is enqueued before the matmul kernel below.
-        if do_async and ctx.weight_needs_grad:
-            ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(input_, group, seq_dim)
+        # Skipped when `reused` — the forward already gathered this exact tensor.
+        if do_async and ctx.weight_needs_grad and not reused:
+            ag_buf, ag_handle, ag_transpose = _async_all_gather_seq_dim(saved, group, seq_dim)
         else:
             ag_buf = ag_handle = ag_transpose = None
 
@@ -597,8 +615,16 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
                 grad_input_full, group, seq_dim
             )
 
-        # Step 4+5: wait for AG, compute wgrad (overlaps with RS)
-        if ag_handle is not None:
+        # Step 4+5: wgrad. Three cases: reused forward gather (no AG needed),
+        # awaited async AG, or single-GPU (saved tensor is already the full input).
+        if reused:
+            gathered = saved
+            if gathered.dtype != weight.dtype:
+                gathered = gathered.to(weight.dtype)
+            gathered_2d = gathered.reshape(-1, weight.shape[1])
+            grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
+            grad_weight = grad_out_2d.t().matmul(gathered_2d)
+        elif ag_handle is not None:
             ag_handle.wait()
             gathered = ag_buf.transpose(0, seq_dim).contiguous() if ag_transpose else ag_buf
             if gathered.dtype != weight.dtype:
@@ -608,7 +634,7 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
             grad_weight = grad_out_2d.t().matmul(gathered_2d)
         elif ctx.weight_needs_grad:
             # Single-GPU: full input is already on this rank
-            inp = input_.to(weight.dtype) if input_.dtype != weight.dtype else input_
+            inp = saved.to(weight.dtype) if saved.dtype != weight.dtype else saved
             inp_2d      = inp.reshape(-1, weight.shape[1])
             grad_out_2d = grad_output.reshape(-1, grad_output.shape[-1])
             grad_weight = grad_out_2d.t().matmul(inp_2d)
@@ -626,7 +652,8 @@ class _ColumnLinearFwdBwd(torch.autograd.Function):
             grad_output.sum(list(range(grad_output.ndim - 1))) if ctx.use_bias else None
         )
 
-        return (grad_input, grad_weight, grad_bias, None, None)  # group, seq_dim: no grad
+        # group, seq_dim, save_gathered: no grad
+        return (grad_input, grad_weight, grad_bias, None, None, None)
 
 
 class _RowLinearFwdBwd(torch.autograd.Function):

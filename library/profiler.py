@@ -1,7 +1,14 @@
 from tqdm import tqdm
+import os
 import time
 import torch
 import torch.distributed as dist
+
+try:
+    import pynvml
+    _NVML_AVAILABLE = True
+except ImportError:
+    _NVML_AVAILABLE = False
 
 class StepProfiler:
     def __init__(self, accelerator, enabled=False, profile_microbatch=False):
@@ -11,13 +18,28 @@ class StepProfiler:
 
         self._cum_fwd = 0.0
         self._cum_bwd = 0.0
+        self._cum_comm = 0.0
         self._t0_step = None
         self._t0 = None  # start of current micro-batch
         self._t1 = None  # end of fwd
         self._t2 = None  # end of bwd
         self._t3 = None  # end of comm
 
-        self._peak_vram = 0  # peak VRAM bytes over the whole step
+        self._peak_vram = 0  # peak real VRAM 
+        self._nvml_handle = None
+        if enabled and _NVML_AVAILABLE:
+            try:
+                pynvml.nvmlInit()
+                local_index = accelerator.device.index or 0
+                cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+                if cvd:
+                    ids = [int(x) for x in cvd.split(",") if x.strip() != ""]
+                    nvml_index = ids[local_index] if local_index < len(ids) else local_index
+                else:
+                    nvml_index = local_index
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(nvml_index)
+            except Exception:
+                self._nvml_handle = None
 
         # Microbatch tracking
         self._mb_index = 0
@@ -40,11 +62,6 @@ class StepProfiler:
         # Memory snapshot
         self._snapshot_step = None
 
-        # Resolve world size and rank from torch.distributed when available.
-        # This handles TP/SP mode where the Accelerator is in NO distributed
-        # mode (num_processes=1) but dist IS initialized across TP ranks, and
-        # where process_index is spoofed to 0 on all ranks so that
-        # accelerator.is_main_process / num_processes can't be trusted.
         try:
             if dist.is_initialized() and dist.get_world_size() > 1:
                 self._world_size = dist.get_world_size()
@@ -68,6 +85,15 @@ class StepProfiler:
             except Exception:
                 pass
 
+    def _nvml_poll(self):
+        if self._nvml_handle is None:
+            return
+        try:
+            used = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle).used
+            self._peak_vram = max(self._peak_vram, used)
+        except Exception:
+            pass
+
     def request_snapshot(self, step: int):
         """Schedule a full memory snapshot for the given global step.
 
@@ -88,11 +114,11 @@ class StepProfiler:
             self._t0_step = now
             self._mb_index = 0
             self._mb_lines = []
-            torch.cuda.reset_peak_memory_stats()
             if self._snapshot_step is not None:
                 torch.cuda.memory._record_memory_history(max_entries=100_000)
         self._t0 = now
         self._mb_index += 1
+        self._nvml_poll()
         if self._comm_timer is not None:
             self._comm_timer.set_context("fwd")
 
@@ -101,6 +127,7 @@ class StepProfiler:
         torch.cuda.synchronize()
         self._t1 = time.perf_counter()
         self._cum_fwd += (self._t1 - self._t0) * 1000
+        self._nvml_poll()
         if self._comm_timer is not None:
             self._comm_timer.set_context("bwd")
 
@@ -111,6 +138,7 @@ class StepProfiler:
         self._cum_bwd += (self._t2 - self._t1) * 1000
         # Default t3 to t2 so that if on_comm_done isn't called, comm time is 0
         self._t3 = self._t2
+        self._nvml_poll()
         if self._comm_timer is not None:
             self._comm_timer.set_context("comm")
 
@@ -124,7 +152,10 @@ class StepProfiler:
     def on_comm_done(self):
         if not self.enabled: return
         torch.cuda.synchronize()
-        self._t3 = time.perf_counter()
+        now = time.perf_counter()
+        self._cum_comm += (now - self._t2) * 1000  # accumulate, since this fires every micro-batch, not just the last
+        self._t3 = now
+        self._nvml_poll()
 
     def on_step_done(self, global_step):
         if not self.enabled: return
@@ -134,8 +165,7 @@ class StepProfiler:
 
         torch.cuda.synchronize()
         t4 = time.perf_counter()
-
-        self._peak_vram = torch.cuda.max_memory_allocated()
+        self._nvml_poll()
 
         # Dump snapshot if this was the requested step
         if self._snapshot_step is not None:
@@ -148,15 +178,12 @@ class StepProfiler:
             torch.cuda.memory._record_memory_history(enabled=None)
             self._snapshot_step = None
 
-        ms_comm = (self._t3 - self._t2) * 1000
-        ms_opt  = (t4 - self._t3) * 1000
+        ms_comm = self._cum_comm  # accumulated across all micro-batches, not just the last
+        ms_opt  = (t4 - self._t3) * 1000  # optimizer.step() only runs once, so the last micro-batch's t3 is correct here
         ms_wall = (t4 - self._t0_step) * 1000
         ms_fwd  = self._cum_fwd
         ms_bwd  = self._cum_bwd
 
-        # Drain comm events on every rank (prevents buffer growth).
-        # Aggregate totals for gathering; keep raw events for context breakdown
-        # on the main process.
         comm_events = []
         ag_ms = rs_ms = ar_ms = a2a_ms = 0.0
         if self._comm_timer is not None:
@@ -170,16 +197,11 @@ class StepProfiler:
 
         def _mb(b): return b / 1024 ** 2
 
-        # Gather per-rank metrics — 10 values per rank:
-        # wall, fwd, bwd, comm, opt, vram_mb, ag_ms, rs_ms, ar_ms, a2a_ms
         metrics = torch.tensor([
             ms_wall, ms_fwd, ms_bwd, ms_comm, ms_opt, _mb(self._peak_vram),
             ag_ms, rs_ms, ar_ms, a2a_ms,
         ], device=self.accelerator.device)
 
-        # Gather per-rank metrics. Use dist.all_gather directly when dist is
-        # initialized so this works in TP/SP mode (accelerator is in NO mode
-        # and its .gather() is a no-op that returns only the local tensor).
         try:
             if dist.is_initialized() and dist.get_world_size() > 1:
                 gather_list = [torch.zeros_like(metrics) for _ in range(self._world_size)]
@@ -294,9 +316,10 @@ class StepProfiler:
 
             tqdm.write("\n" + "\n".join(output_lines))
 
-        # Reset for next global optimization step
+
         self._cum_fwd = 0.0
         self._cum_bwd = 0.0
+        self._cum_comm = 0.0
         self._peak_vram = 0
         self._mb_index = 0
         self._mb_lines = []

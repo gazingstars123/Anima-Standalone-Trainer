@@ -3,6 +3,7 @@
 import argparse
 import ast
 import asyncio
+import gc
 from concurrent.futures import Future, ThreadPoolExecutor
 import datetime
 import importlib
@@ -180,6 +181,14 @@ def split_train_val(
         split = len(paths) - round(len(paths) * validation_split)
         return paths[split:], sizes[split:]
 
+
+#Garbage Collectors Helper
+def freeze_gc():
+    gc.collect()
+    gc.freeze()
+
+def dataloader_worker_init(worker_id):
+    gc.freeze()
 
 class ImageInfo:
     def __init__(self, image_key: str, num_repeats: int, caption: str, is_reg: bool, absolute_path: str) -> None:
@@ -1167,31 +1176,55 @@ class BaseDataset(torch.utils.data.Dataset):
         max_workers = min(max_workers, caching_strategy.batch_size)  # max_workers should be less than batch_size
         executor = ThreadPoolExecutor(max_workers)
 
+        preset_npz_keys = {info.image_key for info in image_infos if info.latents_npz is not None}  # fine tuning dataset
+
+        cache_available_by_key = {}
+        if caching_strategy.cache_to_disk:
+            for info in image_infos:
+                if info.image_key not in preset_npz_keys:
+                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
+
+            own_infos = [
+                info
+                for i, info in enumerate(image_infos)
+                if info.image_key not in preset_npz_keys and i % num_processes == process_index
+            ]
+            validity_workers = min(32, os.cpu_count() or 4, len(own_infos)) or 1
+            with ThreadPoolExecutor(validity_workers) as validity_executor:
+                availabilities = list(
+                    tqdm(
+                        validity_executor.map(
+                            lambda info: caching_strategy.is_disk_cached_latents_expected(
+                                info.bucket_reso,
+                                info.latents_npz,
+                                self.image_to_subset[info.image_key].flip_aug,
+                                self.image_to_subset[info.image_key].alpha_mask,
+                            ),
+                            own_infos,
+                        ),
+                        total=len(own_infos),
+                        disable=not accelerator.is_main_process,
+                    )
+                )
+            cache_available_by_key = {info.image_key: avail for info, avail in zip(own_infos, availabilities)}
+
         try:
             # iterate images
             logger.info("caching latents...")
             for i, info in enumerate(tqdm(image_infos, disable=not accelerator.is_main_process)):
                 subset = self.image_to_subset[info.image_key]
 
-                if info.latents_npz is not None:  # fine tuning dataset
+                if info.image_key in preset_npz_keys:  # fine tuning dataset
                     continue
 
                 # check disk cache exists and size of latents
                 if caching_strategy.cache_to_disk:
-                    # info.latents_npz = os.path.splitext(info.absolute_path)[0] + file_suffix
-                    info.latents_npz = caching_strategy.get_latents_npz_path(info.absolute_path, info.image_size)
-
                     # if the modulo of num_processes is not equal to process_index, skip caching
                     # this makes each process cache different latents
                     if i % num_processes != process_index:
                         continue
 
-                    # print(f"{process_index}/{num_processes} {i}/{len(image_infos)} {info.latents_npz}")
-
-                    cache_available = caching_strategy.is_disk_cached_latents_expected(
-                        info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
-                    )
-                    if cache_available:  # do not add to batch
+                    if cache_available_by_key[info.image_key]:  # do not add to batch
                         continue
 
                 # if batch is not empty and condition is changed, flush the batch. Note that current_condition is not None if batch is not empty
@@ -1317,27 +1350,35 @@ class BaseDataset(torch.utils.data.Dataset):
         process_index = accelerator.process_index
 
         logger.info("checking cache validity...")
-        for i, info in enumerate(tqdm(image_infos, disable=not accelerator.is_main_process)):
-            # check disk cache exists and size of text encoder outputs
-            if caching_strategy.cache_to_disk:
-                te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
-                info.text_encoder_outputs_npz = te_out_npz  # set npz filename regardless of cache availability
+        if caching_strategy.cache_to_disk:
+            for i, info in enumerate(image_infos):
+                info.text_encoder_outputs_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
 
-                # if the modulo of num_processes is not equal to process_index, skip caching
-                # this makes each process cache different text encoder outputs
-                if i % num_processes != process_index:
-                    continue
-
-                cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
-                if cache_available:  # do not add to batch
-                    continue
-
-            batch.append(info)
-
-            # if number of data in batch is enough, flush the batch
-            if len(batch) >= batch_size:
-                batches.append(batch)
-                batch = []
+            own_infos = [info for i, info in enumerate(image_infos) if i % num_processes == process_index]
+            max_workers = min(32, os.cpu_count() or 4, len(own_infos)) or 1
+            with ThreadPoolExecutor(max_workers) as validity_executor:
+                availabilities = list(
+                    tqdm(
+                        validity_executor.map(
+                            lambda info: caching_strategy.is_disk_cached_outputs_expected(info.text_encoder_outputs_npz),
+                            own_infos,
+                        ),
+                        total=len(own_infos),
+                        disable=not accelerator.is_main_process,
+                    )
+                )
+            for info, cache_available in zip(own_infos, availabilities):
+                if not cache_available:
+                    batch.append(info)
+                    if len(batch) >= batch_size:
+                        batches.append(batch)
+                        batch = []
+        else:
+            for info in image_infos:
+                batch.append(info)
+                if len(batch) >= batch_size:
+                    batches.append(batch)
+                    batch = []
 
         if len(batch) > 0:
             batches.append(batch)
@@ -1823,8 +1864,7 @@ class BaseDataset(torch.utils.data.Dataset):
 
         example["network_multipliers"] = torch.FloatTensor([self.network_multiplier] * len(captions))
 
-        if self.debug_dataset:
-            example["image_keys"] = bucket[image_index : image_index + self.batch_size]
+        example["image_keys"] = bucket[image_index : image_index + self.batch_size]
         return example
 
     def get_item_for_caching(self, bucket, bucket_batch_size, image_index):
@@ -1971,6 +2011,21 @@ class DreamBoothDataset(BaseDataset):
                     break
             return caption
 
+        def caption_signature(img_path, caption_extension):
+            base_name = os.path.splitext(img_path)[0]
+            base_name_face_det = base_name
+            tokens = base_name.split("_")
+            if len(tokens) >= 5:
+                base_name_face_det = "_".join(tokens[:-4])
+
+            for cap_path in [base_name + caption_extension, base_name_face_det + caption_extension]:
+                try:
+                    st = os.stat(cap_path)
+                except OSError:
+                    continue
+                return [st.st_mtime_ns, st.st_size]
+            return None
+
         def load_dreambooth_dir(subset: DreamBoothSubset):
             if not os.path.isdir(subset.image_dir):
                 logger.warning(f"not directory: {subset.image_dir}")
@@ -1978,6 +2033,7 @@ class DreamBoothDataset(BaseDataset):
 
             info_cache_file = os.path.join(subset.image_dir, self.IMAGE_INFO_CACHE_FILE)
             use_cached_info_for_subset = subset.cache_info
+            actual_paths = None
             if use_cached_info_for_subset:
                 logger.info(
                     f"using cached image info for this subset / このサブセットで、キャッシュされた画像情報を使います: {info_cache_file}"
@@ -1991,14 +2047,130 @@ class DreamBoothDataset(BaseDataset):
 
             if use_cached_info_for_subset:
                 # json: {`img_path`:{"caption": "caption...", "resolution": [width, height]}, ...}
-                with open(info_cache_file, "r", encoding="utf-8") as f:
-                    metas = json.load(f)
-                img_paths = list(metas.keys())
-                sizes: List[Optional[Tuple[int, int]]] = [meta["resolution"] for meta in metas.values()]
+                try:
+                    with open(info_cache_file, "r", encoding="utf-8") as f:
+                        metas = json.load(f)
+                except Exception as e:
+                    logger.warning(
+                        f"failed to load metadata cache ({e}). Discarding cache and rebuilding from disk..."
+                    )
+                    metas = None
+                    use_cached_info_for_subset = False
 
-                # we may need to check image size and existence of image files, but it takes time, so user should check it before training
-            else:
-                img_paths = glob_images(subset.image_dir, "*")
+                if use_cached_info_for_subset and metas is not None:
+                    # Validate cache against actual files on disk
+                    actual_paths = set(glob_images(subset.image_dir, "*"))
+                    cached_paths = set(metas.keys())
+                    added = actual_paths - cached_paths
+                    removed = cached_paths - actual_paths
+
+                    import concurrent.futures
+                    optimal_workers = max(1, (os.cpu_count() or 2) * 3 // 4)
+
+                    survivors = sorted(actual_paths & cached_paths)
+                    changed = set()
+                    legacy = 0
+                    if survivors:
+                        def _sig(path):
+                            return path, caption_signature(path, subset.caption_extension)
+
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                            for path, sig in tqdm(
+                                executor.map(_sig, survivors, chunksize=64),
+                                total=len(survivors),
+                                desc="checking captions",
+                                disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0",
+                            ):
+                                entry = metas.get(path)
+                                if not isinstance(entry, dict):
+                                    changed.add(path)
+                                    continue
+                                if "caption_sig" not in entry:
+                                    # cache written before caption-change detection existed:
+                                    # refresh once so its captions are known-current, then
+                                    # the signature is stored and this won't repeat
+                                    legacy += 1
+                                    changed.add(path)
+                                elif entry.get("caption_sig") != sig:
+                                    changed.add(path)
+
+                    if legacy:
+                        logger.warning(
+                            f"{legacy} entries in metadata_cache.json predate caption-change detection; "
+                            "re-reading their captions once to guarantee they are current"
+                        )
+
+                    if added or removed or changed:
+                        logger.warning(
+                            f"metadata_cache.json is stale ({len(added)} added, {len(removed)} removed, "
+                            f"{len(changed)} caption(s) changed). Updating cache incrementally..."
+                        )
+                        # Remove deleted files
+                        for path in removed:
+                            metas.pop(path, None)
+
+                        # Re-read added files (caption + image size) and changed files
+                        # (caption only -- the image itself did not change)
+                        refresh_paths = sorted(added | changed)
+                        if refresh_paths:
+                            added_set = added
+                            logger.info(
+                                f"Reading captions for {len(refresh_paths)} files "
+                                f"({len(added)} new, {len(changed)} re-captioned) using {optimal_workers} workers..."
+                            )
+
+                            def _process_refresh(path):
+                                cap = read_caption(path, subset.caption_extension, subset.enable_wildcard)
+                                sig = caption_signature(path, subset.caption_extension)
+                                sz = self.get_image_size(path) if path in added_set else None
+                                return path, cap, sz, sig
+
+                            with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                                for path, cap, sz, sig in tqdm(
+                                    executor.map(_process_refresh, refresh_paths, chunksize=32),
+                                    total=len(refresh_paths),
+                                    desc="caching new/changed files",
+                                    disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0",
+                                ):
+                                    if cap is None:
+                                        cap = subset.class_tokens if subset.class_tokens is not None else ""
+                                    if sz is not None:
+                                        resolution = list(sz)
+                                    else:
+                                        prev = metas.get(path)
+                                        resolution = (prev or {}).get("resolution", [None, None])
+                                    metas[path] = {"caption": cap, "resolution": resolution, "caption_sig": sig}
+
+                        # Write the updated cache atomically only on the main process (Rank 0) to avoid multi-GPU write conflicts
+                        is_main_process = os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"
+                        if is_main_process:
+                            tmp_file = info_cache_file + ".tmp"
+                            import time
+                            for attempt in range(5):
+                                try:
+                                    with open(tmp_file, "w", encoding="utf-8") as f:
+                                        json.dump(metas, f, ensure_ascii=False)
+                                    # Atomic replace. On Windows, this can fail with WinError 32 if another process has the file open.
+                                    os.replace(tmp_file, info_cache_file)
+                                    logger.info(f"Updated metadata cache file: {info_cache_file}")
+                                    break
+                                except Exception as e:
+                                    if attempt == 4:
+                                        logger.error(f"Failed to write metadata cache file: {e}")
+                                    if os.path.exists(tmp_file):
+                                        try:
+                                            os.remove(tmp_file)
+                                        except:
+                                            pass
+                                    time.sleep(0.5)
+
+                    # Sort metas to maintain deterministic ordering
+                    sorted_metas = {k: metas[k] for k in sorted(metas.keys())}
+                    img_paths = list(sorted_metas.keys())
+                    sizes = [tuple(sorted_metas[path]["resolution"]) if sorted_metas[path]["resolution"] is not None else None for path in img_paths]
+
+            if not use_cached_info_for_subset:
+                img_paths = sorted(actual_paths) if actual_paths is not None else glob_images(subset.image_dir, "*")
                 sizes: List[Optional[Tuple[int, int]]] = [None] * len(img_paths)
 
                 # new caching: get image size from cache files
@@ -2036,12 +2208,6 @@ class DreamBoothDataset(BaseDataset):
                             size_set_count += 1
                     logger.info(f"set image size from cache files: {size_set_count}/{len(img_paths)}")
 
-            # We want to create a training and validation split. This should be improved in the future
-            # to allow a clearer distinction between training and validation. This can be seen as a
-            # short-term solution to limit what is necessary to implement validation datasets
-            #
-            # We split the dataset for the subset based on if we are doing a validation split
-            # The self.is_training_dataset defines the type of dataset, training or validation
             # if self.is_training_dataset is True -> training dataset
             # if self.is_training_dataset is False -> validation dataset
             if self.validation_split > 0.0:
@@ -2110,12 +2276,46 @@ class DreamBoothDataset(BaseDataset):
 
             if not use_cached_info_for_subset and subset.cache_info:
                 logger.info(f"cache image info for / 画像情報をキャッシュします : {info_cache_file}")
-                sizes = [self.get_image_size(img_path) for img_path in tqdm(img_paths, desc="get image size", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0")]
+                sizes = [None] * len(img_paths)
+                def _get_size(i, path):
+                    return i, self.get_image_size(path)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                    size_futures = [executor.submit(_get_size, i, p) for i, p in enumerate(img_paths)]
+                    for future in tqdm(concurrent.futures.as_completed(size_futures), total=len(img_paths), desc="get image size", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
+                        i, sz = future.result()
+                        sizes[i] = sz
+                # caption signatures, so a later run can tell whether a .txt was edited
+                cap_sigs = [None] * len(img_paths)
+                def _get_cap_sig(i, path):
+                    return i, caption_signature(path, subset.caption_extension)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=optimal_workers) as executor:
+                    sig_futures = [executor.submit(_get_cap_sig, i, p) for i, p in enumerate(img_paths)]
+                    for future in tqdm(concurrent.futures.as_completed(sig_futures), total=len(img_paths), desc="caption signatures", disable=os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")) != "0"):
+                        i, sig = future.result()
+                        cap_sigs[i] = sig
+
                 matas = {}
-                for img_path, caption, size in zip(img_paths, captions, sizes):
-                    matas[img_path] = {"caption": caption, "resolution": list(size)}
-                with open(info_cache_file, "w", encoding="utf-8") as f:
-                    json.dump(matas, f, ensure_ascii=False, indent=2)
+                for img_path, caption, size, cap_sig in zip(img_paths, captions, sizes, cap_sigs):
+                    matas[img_path] = {"caption": caption, "resolution": list(size), "caption_sig": cap_sig}
+                is_main_process = os.environ.get("RANK", "0") == "0" and os.environ.get("LOCAL_RANK", "0") == "0"
+                if is_main_process:
+                    tmp_file = info_cache_file + ".tmp"
+                    import time
+                    for attempt in range(5):
+                        try:
+                            with open(tmp_file, "w", encoding="utf-8") as f:
+                                json.dump(matas, f, ensure_ascii=False)
+                            os.replace(tmp_file, info_cache_file)
+                            break
+                        except Exception as e:
+                            if attempt == 4:
+                                logger.error(f"Failed to write initial metadata cache file: {e}")
+                            if os.path.exists(tmp_file):
+                                try:
+                                    os.remove(tmp_file)
+                                except:
+                                    pass
+                            time.sleep(0.5)
                 logger.info(f"cache image info done for / 画像情報を出力しました : {info_cache_file}")
 
             # if sizes are not set, image size will be read in make_buckets
@@ -4037,6 +4237,18 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="enable static_graph for DDP / DDPでstatic_graphを有効にする",
     )
     parser.add_argument(
+        "--ddp_find_unused_parameters",
+        action="store_true",
+        default=False,
+        help="enable find_unused_parameters for DDP",
+    )
+    parser.add_argument(
+        "--ddp_bucket_cap_mb",
+        type=int,
+        default=None,
+        help="gradient bucket size in MB for DDP (default: 25). Larger values mean fewer AllReduce ops and faster training.",
+    )
+    parser.add_argument(
         "--use_cuda_direct",
         action="store_true",
         help="(Windows multi-GPU only) use cuda_direct backend for GPU-to-GPU transfers instead of Gloo."
@@ -5554,9 +5766,12 @@ def prepare_accelerator(args: argparse.Namespace):
         ),
         (
             DistributedDataParallelKwargs(
-                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view, static_graph=args.ddp_static_graph
+                gradient_as_bucket_view=args.ddp_gradient_as_bucket_view,
+                static_graph=args.ddp_static_graph,
+                find_unused_parameters=getattr(args, 'ddp_find_unused_parameters', False),
+                bucket_cap_mb=getattr(args, 'ddp_bucket_cap_mb', None) or 25,
             )
-            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph
+            if args.ddp_gradient_as_bucket_view or args.ddp_static_graph or getattr(args, 'ddp_find_unused_parameters', False) or getattr(args, 'ddp_bucket_cap_mb', None)
             else None
         ),
     ]
@@ -6092,6 +6307,12 @@ def save_state_on_train_end(args: argparse.Namespace, accelerator):
     os.makedirs(args.output_dir, exist_ok=True)
 
     state_dir = os.path.join(args.output_dir, LAST_STATE_NAME.format(model_name))
+    
+    # Fix incomplete Muon optimizer state under DDP before saving
+    from library.muon_optimizer import gather_muon_state_before_save
+    for optimizer in getattr(accelerator, "_optimizers", []):
+        gather_muon_state_before_save(optimizer)
+    
     accelerator.save_state(state_dir)
 
     if args.save_state_to_huggingface:

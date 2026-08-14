@@ -42,47 +42,141 @@ def _synchronize_device(device: torch.device):
         torch.mps.synchronize()
 
 
-def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+# Offloading frees/refills each weight's GPU storage in place
+_param_cpu_buffers: dict[int, torch.Tensor] = {}
+_param_cpu_buffers_pinned: dict[int, bool] = {}
+
+
+def _weight_params(layer: nn.Module):
+    for module in layer.modules():
+        weight = getattr(module, "weight", None)
+        if weight is not None:
+            yield weight
+
+
+def _cpu_buffer_for(weight: torch.Tensor) -> Tuple[torch.Tensor, bool]:
+    key = id(weight)
+    buf = _param_cpu_buffers.get(key)
+    if buf is None:
+        buf = torch.empty_like(weight, device="cpu")
+        pinned = True
+        try:
+            buf = buf.pin_memory()
+        except RuntimeError:
+            pinned = False
+        _param_cpu_buffers[key] = buf
+        _param_cpu_buffers_pinned[key] = pinned
+    return buf, _param_cpu_buffers_pinned[key]
+
+
+def _offload_weights(layer: nn.Module, non_blocking: bool) -> list:
+    # copy weights to CPU buffers; caller frees storages after the copies complete
+    offloaded = []
+    for weight in _weight_params(layer):
+        if weight.device.type != "cuda" or weight.data.untyped_storage().nbytes() == 0:
+            continue
+        buf, pinned = _cpu_buffer_for(weight)
+        copy_non_blocking = non_blocking and pinned
+        if copy_non_blocking and weight.data.is_cuda:
+            # tell the caching allocator this storage is read on the current stream
+            weight.data.record_stream(torch.cuda.current_stream())
+        buf.copy_(weight.data, non_blocking=copy_non_blocking)
+        offloaded.append(weight)
+    return offloaded
+
+
+def _free_weights(weights: list):
+    for weight in weights:
+        weight.data.untyped_storage().resize_(0)
+
+
+def _load_weights(layer: nn.Module, non_blocking: bool):
+    for weight in _weight_params(layer):
+        if weight.device.type != "cuda":
+            continue
+        storage = weight.data.untyped_storage()
+        if storage.nbytes() != 0:
+            continue
+        key = id(weight)
+        buf = _param_cpu_buffers.get(key)
+        if buf is None:
+            raise RuntimeError("block swap: offloaded weight has no CPU buffer to restore from")
+        pinned = _param_cpu_buffers_pinned.get(key, False)
+        storage.resize_(buf.numel() * buf.element_size())
+        weight.data.copy_(buf, non_blocking=non_blocking and pinned)
+
+
+def materialize_optimizer_params(optimizer) -> int:
+    # refill offloaded weights so optimizer.step() sees real storage
+    n = 0
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            if p is None or p.grad is None or p.device.type != "cuda":
+                continue
+            storage = p.data.untyped_storage()
+            if storage.nbytes() == 0:
+                buf = _param_cpu_buffers.get(id(p))
+                if buf is None:
+                    continue
+                storage.resize_(buf.numel() * buf.element_size())
+                p.data.copy_(buf, non_blocking=False)
+                n += 1
+    return n
+
+
+def _state_dict_materialize_hook(module: nn.Module, state_dict, prefix, local_metadata):
+    # offloaded weights have empty GPU storage; substitute their CPU buffer contents
+    for name, p in module.named_parameters():
+        if p.device.type == "cuda" and p.data.untyped_storage().nbytes() == 0:
+            buf = _param_cpu_buffers.get(id(p))
+            key = prefix + name
+            if buf is not None and key in state_dict:
+                state_dict[key] = buf.detach().clone()
+    return state_dict
+
+
+def _load_state_dict_materialize_pre_hook(
+    module: nn.Module, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+):
+    # re-allocate empty storages so load_state_dict can copy into them
+    for _, p in module.named_parameters():
+        if p.device.type == "cuda":
+            storage = p.data.untyped_storage()
+            if storage.nbytes() == 0:
+                storage.resize_(p.numel() * p.element_size())
+
+
+def _make_load_state_dict_reoffload_post_hook():
+    # re-offload immediately after this block's weights load
+    def hook(module: nn.Module, incompatible_keys):
+        offloaded = _offload_weights(module, non_blocking=False)
+        _free_weights(offloaded)
+
+    return hook
+
+
+def swap_weight_devices_cuda(
+    device: torch.device,
+    layer_to_cpu: nn.Module,
+    layer_to_cuda: nn.Module,
+    stream_out: Optional[torch.Stream] = None,
+    stream_in: Optional[torch.Stream] = None,
+):
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
-
-    weight_swap_jobs: list[Tuple[nn.Module, nn.Module, torch.Tensor, torch.Tensor]] = []
-
-    # This is not working for all cases (e.g. SD3), so we need to find the corresponding modules
-    # for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-    #     print(module_to_cpu.__class__, module_to_cuda.__class__)
-    #     if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-    #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
-
-    modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
-    for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
-        if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
-            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
-            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
-                weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
-            else:
-                if module_to_cuda.weight.data.device.type != device.type:
-                    # print(
-                    #     f"Module {module_to_cuda_name} not found in CPU model or shape mismatch, so not swapping and moving to device"
-                    # )
-                    module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
-    stream = torch.Stream(device="cuda")
-    with torch.cuda.stream(stream):
-        # cuda to cpu
-        for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-            cuda_data_view.record_stream(stream)
-            module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
+    stream_out = stream_out or torch.Stream(device="cuda")  # reuse caller's streams to avoid per-call stream creation
+    stream_in = stream_in or torch.Stream(device="cuda")
+    with torch.cuda.stream(stream_out):
+        offloaded = _offload_weights(layer_to_cpu, non_blocking=True)
+    with torch.cuda.stream(stream_in):
+        _load_weights(layer_to_cuda, non_blocking=True)  # allocates before layer_to_cpu is freed, needs +1 block headroom
 
-        stream.synchronize()
+    stream_out.synchronize()  # D2H must land before its storage is freed
+    _free_weights(offloaded)
+    stream_in.synchronize()
 
-        # cpu to cuda
-        for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-            cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
-            module_to_cuda.weight.data = cuda_data_view
-
-    stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
 
@@ -112,9 +206,11 @@ def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, l
 
 
 def weighs_to_device(layer: nn.Module, device: torch.device):
-    for module in layer.modules():
-        if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data = module.weight.data.to(device, non_blocking=True)
+    if device.type == "cuda":
+        _load_weights(layer, non_blocking=False)
+    else:
+        offloaded = _offload_weights(layer, non_blocking=False)
+        _free_weights(offloaded)
 
 
 class Offloader:
@@ -131,10 +227,13 @@ class Offloader:
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
         self.cuda_available = device.type == "cuda"
+        # created once and reused across swaps, avoids a stream-create call on every block swap
+        self._swap_stream_out = torch.Stream(device="cuda") if self.cuda_available else None
+        self._swap_stream_in = torch.Stream(device="cuda") if self.cuda_available else None
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
-            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
+            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda, self._swap_stream_out, self._swap_stream_in)
         else:
             swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
 
@@ -197,6 +296,14 @@ class ModelOffloader(Offloader):
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
+
+        # keep state_dict/load_state_dict correct while weights are offloaded
+        num_blocks = len(blocks)
+        for i, block in enumerate(blocks):
+            block._register_state_dict_hook(_state_dict_materialize_hook)
+            block._register_load_state_dict_pre_hook(_load_state_dict_materialize_pre_hook, with_module=True)
+            if i >= num_blocks - blocks_to_swap:
+                block.register_load_state_dict_post_hook(_make_load_state_dict_reoffload_post_hook())
 
         if self.supports_backward:
             # register backward hooks

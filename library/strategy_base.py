@@ -419,6 +419,8 @@ class LatentsCachingStrategy:
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         raise NotImplementedError
 
+    _known_cache_dirs: set = set()
+
     def _get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         """
         Shared implementation for getting latents npz path in a subfolder.
@@ -427,10 +429,11 @@ class LatentsCachingStrategy:
         image_dir = os.path.dirname(absolute_path)
         basename = os.path.splitext(os.path.basename(absolute_path))[0]
         cache_dir = os.path.join(image_dir, "latent_cache")
-        
-        if self.cache_to_disk and not os.path.exists(cache_dir):
+
+        if self.cache_to_disk and cache_dir not in LatentsCachingStrategy._known_cache_dirs:
             os.makedirs(cache_dir, exist_ok=True)
-            
+            LatentsCachingStrategy._known_cache_dirs.add(cache_dir)
+
         return os.path.join(
             cache_dir,
             f"{basename}_{image_size[0]:04d}x{image_size[1]:04d}{self.cache_suffix}"

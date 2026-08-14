@@ -180,15 +180,57 @@ def _build_parallel_linear(
     return None, None
 
 
-def _mark_tp_sharding_metadata(model: nn.Module) -> None:
-    # RowParallel bias is replicated across TP ranks and must be synced.
+def _mark_tp_sharding_metadata(model: nn.Module, rank: int, world_size: int) -> None:
+    """Tag every TP-sharded parameter with reconstruction metadata.
+
+    ``_tp_sharded`` gates sync_replicated_grads (skip these params) and the
+    LoRA/FFT TP grad-norm clipping (all-reduce-sum these params' contribution
+    instead of counting it once). The rest of the ``_tp_*`` fields let a
+    TP-aware optimizer (see muon_optimizer.TPMuonWithAuxAdam) reconstruct the
+    full unsharded weight for an operation that must see the whole matrix
+    (Newton-Schulz orthogonalization), then re-shard the result — using the
+    same shard/pad/merge helpers apply_parallelism used to build the shard in
+    the first place (layers._shard_colwise / _shard_packed_colwise /
+    _shard_rowwise for re-sharding; layers.merge_column_shards /
+    merge_row_shards for reconstruction).
+
+    ``rank``/``world_size`` come from the same ``ProcessGroups`` the caller
+    already resolved for sharding (not re-derived via dist.get_rank(group=...)
+    here) — every ColumnParallelLinear/RowParallelLinear in a given
+    apply_parallelism() call shares one TP group, and re-deriving per module
+    would require a live default process group even in contexts (e.g. tests
+    with a fake group double) that only need the metadata, not a collective.
+
+    RowParallel bias is replicated across TP ranks and must be synced.
+    """
     for module in model.modules():
         if isinstance(module, ColumnParallelLinear):
+            shard_kind = "col" if module.packed_parts is None else "packed_col"
             for p in module.parameters():
-                p._tp_sharded = True
+                p._tp_sharded              = True
+                p._tp_shard_kind           = shard_kind
+                p._tp_rank                 = rank
+                p._tp_world_size           = world_size
+                p._tp_packed_parts         = module.packed_parts
+                p._tp_original_part_size   = module.original_part_size
+                p._tp_padded_part_size     = module.padded_part_size
+                p._tp_original_out_features = module.original_out_features
+                p._tp_original_in_features  = module.original_in_features
+                p._tp_allow_padding        = module.allow_padding
+                p._tp_padding_multiple     = module.padding_multiple
             continue
         if isinstance(module, RowParallelLinear):
-            module.weight._tp_sharded = True
+            module.weight._tp_sharded              = True
+            module.weight._tp_shard_kind            = "row"
+            module.weight._tp_rank                  = rank
+            module.weight._tp_world_size            = world_size
+            module.weight._tp_packed_parts          = None
+            module.weight._tp_original_part_size    = None
+            module.weight._tp_padded_part_size      = None
+            module.weight._tp_original_out_features = module.original_out_features
+            module.weight._tp_original_in_features  = module.original_in_features
+            module.weight._tp_allow_padding         = module.allow_padding
+            module.weight._tp_padding_multiple      = module.padding_multiple
             if module.bias is not None:
                 module.bias._tp_sharded = False
                 if module.sequence_parallel:
@@ -260,7 +302,7 @@ def apply_parallelism(
         setattr(parent, attr, new_layer)
 
     # Tag sharded parameters so sync_replicated_grads can skip them.
-    _mark_tp_sharding_metadata(model)
+    _mark_tp_sharding_metadata(model, rank, world_size)
 
     # Store config/groups on the model so forward() can access SP boundaries
     model._wdp_config = config
@@ -278,8 +320,65 @@ def apply_parallelism(
 
 
 # ---------------------------------------------------------------------------
+# set_wgrad_gather_reuse
+# ---------------------------------------------------------------------------
+
+def set_wgrad_gather_reuse(model: nn.Module, enabled: bool) -> int:
+    """Toggle forward-gather reuse for the wgrad computation on every
+    ColumnParallelLinear in ``model`` (see ColumnParallelLinear.forward and
+    collectives._ColumnLinearFwdBwd).
+
+    When enabled, the SP fused backward skips re-all-gathering the input
+    shard for the weight gradient and reuses the tensor the forward pass
+    already gathered — one fewer collective per trainable column-parallel
+    layer per backward. Only takes effect for layers whose weight requires
+    grad and whose TP group size > 1 (frozen/LoRA-base and single-GPU layers
+    are unaffected either way).
+
+    Costs extra memory to keep the full-sequence activation alive across the
+    backward pass; safe to enable unconditionally under gradient
+    checkpointing (that activation is recomputed and freed immediately
+    after use), but should be left off otherwise unless VRAM allows it.
+
+    Returns the number of ColumnParallelLinear modules touched.
+    """
+    n = 0
+    for module in model.modules():
+        if isinstance(module, ColumnParallelLinear):
+            module.reuse_fwd_gather_for_wgrad = bool(enabled)
+            n += 1
+    return n
+
+
+# ---------------------------------------------------------------------------
 # sync_replicated_grads
 # ---------------------------------------------------------------------------
+
+def _coalesced_all_reduce_by_dtype(
+    entries: list, group: dist.ProcessGroup, world_size: int, *, divide: bool,
+) -> None:
+    """All-reduce (param, grad) pairs, one flat collective per distinct grad dtype.
+
+    torch.cat requires matching dtypes, so mixed-precision grads (e.g. under
+    --muon_fp32_sensitive, which upcasts adaln_modulation/q_norm/k_norm to
+    fp32 while the rest of the model trains in bf16) are bucketed separately
+    instead of crashing. Same-dtype callers (the common case) still get
+    exactly one collective, unchanged from before.
+    """
+    buckets: dict = {}
+    for p, g in entries:
+        buckets.setdefault(g.dtype, []).append((p, g))
+    for bucket in buckets.values():
+        flat = torch.cat([g.contiguous().view(-1) for _, g in bucket])
+        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+        if divide:
+            flat.div_(world_size)
+        offset = 0
+        for p, g in bucket:
+            n = g.numel()
+            g.copy_(flat[offset: offset + n].view_as(g))
+            offset += n
+
 
 def sync_replicated_grads(model: nn.Module, group: dist.ProcessGroup) -> None:
     """
@@ -289,10 +388,10 @@ def sync_replicated_grads(model: nn.Module, group: dist.ProcessGroup) -> None:
     (LayerNorm, AdaLN projections, embedders, final proj) diverge between
     ranks after the first optimizer step.
 
-    Dense params are coalesced into a single flat all-reduce (one collective
-    instead of one per parameter). This is critical for backends with high
-    per-collective overhead (e.g. cuda_direct on Windows) where N individual
-    all-reduces x barrier_cost dominates comm time.
+    Dense params are coalesced into one flat all-reduce per grad dtype
+    (instead of one collective per parameter). This is critical for backends
+    with high per-collective overhead (e.g. cuda_direct on Windows) where N
+    individual all-reduces x barrier_cost dominates comm time.
 
     Sparse and partial-grad params are handled separately since they need
     different reduce semantics or can't be safely flattened.
@@ -318,26 +417,13 @@ def sync_replicated_grads(model: nn.Module, group: dist.ProcessGroup) -> None:
         else:
             dense_mean.append((p, grad))
 
-    # Coalesced all-reduce for mean params (the common case, one collective).
+    # Coalesced all-reduce for mean params (the common case).
     if dense_mean:
-        flat = torch.cat([g.contiguous().view(-1) for _, g in dense_mean])
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
-        flat.div_(world_size)
-        offset = 0
-        for p, g in dense_mean:
-            n = g.numel()
-            g.copy_(flat[offset: offset + n].view_as(g))
-            offset += n
+        _coalesced_all_reduce_by_dtype(dense_mean, group, world_size, divide=True)
 
     # Coalesced all-reduce for partial-grad params (sum semantics, no div).
     if dense_sum:
-        flat = torch.cat([g.contiguous().view(-1) for _, g in dense_sum])
-        dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
-        offset = 0
-        for p, g in dense_sum:
-            n = g.numel()
-            g.copy_(flat[offset: offset + n].view_as(g))
-            offset += n
+        _coalesced_all_reduce_by_dtype(dense_sum, group, world_size, divide=False)
 
     # Individual all-reduce for sparse grads (rare; can't be safely flattened).
     for p, dense_grad, partial in sparse_infos:

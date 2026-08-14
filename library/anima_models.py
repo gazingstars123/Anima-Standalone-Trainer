@@ -317,7 +317,8 @@ class RMSNorm(torch.nn.Module):
     @torch.amp.autocast(device_type='cuda', dtype=torch.float32)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        # cast back for fp32-upcast weights
+        return (output * self.weight).type_as(x)
 
 
 class GPT2FeedForward(nn.Module):
@@ -1305,6 +1306,10 @@ class MiniTrainDIT(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
 
     def set_flash_attn(self, use_flash_attn: bool):
         """Toggle flash attention for all DiT blocks."""
@@ -1794,6 +1799,20 @@ ANIMA_VAE_STD = [
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer']
 
 
+def count_blocks(state_dict_keys, prefix_string):
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    return count
+
+
 def get_dit_config(state_dict, key_prefix=''):
     """Derive DiT configuration from state_dict weight shapes."""
     dit_config = {}
@@ -1817,7 +1836,9 @@ def get_dit_config(state_dict, key_prefix=''):
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
     if dit_config["model_channels"] == 2048:
-        dit_config["num_blocks"] = 28
+        # Count blocks from the state_dict so both the 28-layer base and the
+        # 40-layer expanded checkpoint (and anything in between) are detected.
+        dit_config["num_blocks"] = count_blocks(state_dict.keys(), '{}blocks.'.format(key_prefix) + '{}.')
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
         dit_config["num_blocks"] = 36

@@ -20,7 +20,18 @@ from library.device_utils import init_ipex, clean_memory_on_device
 init_ipex()
 
 from accelerate.utils import set_seed
-from library import deepspeed_utils, anima_models, anima_train_utils, anima_utils, save_utils, strategy_base, strategy_anima, sai_model_spec
+from library import (
+    deepspeed_utils,
+    anima_block_freeze,
+    anima_models,
+    anima_train_utils,
+    anima_utils,
+    custom_offloading_utils,
+    save_utils,
+    strategy_base,
+    strategy_anima,
+    sai_model_spec,
+)
 
 import library.train_util as train_util
 
@@ -153,7 +164,7 @@ class AnimaTrainer:
     @staticmethod
     def _ensure_optimizer_param_devices_match_grads(optimizer) -> int:
         """Move swapped/offloaded params back to their grad device before optimizer.step()."""
-        moved = 0
+        moved = custom_offloading_utils.materialize_optimizer_params(optimizer)
         for group in optimizer.param_groups:
             for p in group["params"]:
                 if p is None or p.grad is None:
@@ -488,6 +499,27 @@ class AnimaTrainer:
 
         train_dit = args.learning_rate != 0
         dit.requires_grad_(train_dit)
+        if train_dit and getattr(args, "freeze_inserted_only_training", False):
+            freeze_summary = anima_block_freeze.apply_inserted_only_training_freeze(dit)
+            if getattr(args, 'llm_adapter_lr', None) != 0 and hasattr(dit, 'llm_adapter'):
+                dit.llm_adapter.requires_grad_(True)
+            accelerator.print(
+                f"freeze_inserted_only_training: enabled for {freeze_summary['block_count']}-block Anima DiT"
+            )
+            accelerator.print(
+                f"  inserted trainable blocks: {freeze_summary['inserted_block_indices']}"
+            )
+            accelerator.print(
+                f"  frozen inherited blocks: {freeze_summary['inherited_block_indices']}"
+            )
+            accelerator.print(
+                f"  trainable parameters after freeze: {freeze_summary['trainable_parameter_count']:,}"
+            )
+            if freeze_summary["non_block_trainable_names"]:
+                accelerator.print(
+                    "  warning: non-block parameters remained trainable after freeze: "
+                    f"{freeze_summary['non_block_trainable_names'][:10]}"
+                )
         if not train_dit:
             dit.to(accelerator.device, dtype=weight_dtype)
 
@@ -513,7 +545,7 @@ class AnimaTrainer:
             # Leaving it trainable causes DDP static-graph violations when batches lack t5_input_ids.
             _llm_adapter_lr = getattr(args, 'llm_adapter_lr', None)
             if _llm_adapter_lr is None:
-                _llm_adapter_lr = 0
+                _llm_adapter_lr = args.learning_rate
             param_groups = anima_train_utils.get_anima_param_groups(
                 dit,
                 base_lr=args.learning_rate,
@@ -612,6 +644,7 @@ class AnimaTrainer:
             collate_fn=collator,
             num_workers=n_workers,
             persistent_workers=args.persistent_data_loader_workers,
+            worker_init_fn=train_util.dataloader_worker_init,
         )
 
         # Build raw phase DataLoaders (prepared individually after accelerator.prepare)
@@ -630,6 +663,7 @@ class AnimaTrainer:
                     collate_fn=_phase_collator,
                     num_workers=n_workers,
                     persistent_workers=args.persistent_data_loader_workers,
+                    worker_init_fn=train_util.dataloader_worker_init,
                 )
             )
 
@@ -730,13 +764,18 @@ class AnimaTrainer:
 
         # resume
         train_util.resume_from_local_or_hf_if_specified(accelerator, args)
+        accelerator.step = 0
 
         # Calculate starting point
         initial_step = 0
         if state_tracker["current_step"] is not None:
             initial_step = state_tracker["current_step"]
 
-        epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        _num_update_steps_per_epoch_for_resume = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+        epoch_to_start = initial_step // _num_update_steps_per_epoch_for_resume
+        batches_to_skip_on_resume = (
+            (initial_step - epoch_to_start * _num_update_steps_per_epoch_for_resume) * args.gradient_accumulation_steps
+        )
         if initial_step > 0:
             assert (
                 args.max_train_steps > initial_step
@@ -809,6 +848,8 @@ class AnimaTrainer:
         accelerator.print(f"  total optimization steps: {args.max_train_steps}")
 
         global_step = initial_step
+
+        train_util.freeze_gc()
 
         progress_bar = tqdm(
             range(args.max_train_steps),
@@ -893,7 +934,15 @@ class AnimaTrainer:
             for m in training_models:
                 m.train()
 
-            for step, batch in enumerate(train_dataloader):
+            if epoch == epoch_to_start and batches_to_skip_on_resume > 0:
+                accelerator.print(
+                    f"  resuming mid-epoch: skipping {batches_to_skip_on_resume} already-consumed batches"
+                )
+                active_dataloader = accelerator.skip_first_batches(train_dataloader, batches_to_skip_on_resume)
+            else:
+                active_dataloader = train_dataloader
+
+            for step, batch in enumerate(active_dataloader):
                 current_step.value = global_step
 
                 # Resolution schedule: override batch from the appropriate phase DataLoader.
@@ -1014,7 +1063,14 @@ class AnimaTrainer:
                         model_pred.float(), target.float(), args.loss_type, "none", huber_c
                     )
                     if args.masked_loss or ("alpha_masks" in batch and batch["alpha_masks"] is not None):
+                        # WanVAE produces 5D latents [B,C,T,H,W] even for images (T=1).
+                        # Squeeze temporal dim so apply_masked_loss sees 4D [B,C,H,W].
+                        squeezed = loss.dim() == 5 and loss.shape[2] == 1
+                        if squeezed:
+                            loss = loss.squeeze(2)
                         loss = apply_masked_loss(loss, batch)
+                        if squeezed:
+                            loss = loss.unsqueeze(2)
                     loss = loss.mean([1, 2, 3, 4])  # (B, C, T, H, W) -> (B,)
 
                     if weighting is not None:
@@ -1027,7 +1083,12 @@ class AnimaTrainer:
                     profiler.on_fwd_done()
                     accelerator.backward(loss)
                     profiler.on_bwd_done()
-                    self.sync_gradients(dit)
+                    # sync_gradients all-reduces TP-replicated params — an
+                    # all-reduce over already-accumulated grads is linear, so
+                    # this only needs to run once per accumulation boundary,
+                    # not on every micro-batch.
+                    if accelerator.sync_gradients:
+                        self.sync_gradients(dit)
                     profiler.on_comm_done()
 
                     if not (args.fused_backward_pass or args.blockwise_fused_optimizers):
@@ -1037,7 +1098,7 @@ class AnimaTrainer:
                                 params_to_clip.extend(m.parameters())
                             accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
-                        if (
+                        if accelerator.sync_gradients and (
                             args.blocks_to_swap
                             or getattr(args, "cpu_offload_checkpointing", False)
                             or getattr(args, "unsloth_offload_checkpointing", False)
@@ -1158,6 +1219,10 @@ class AnimaTrainer:
         optimizer_eval_fn()
 
         del accelerator
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
         self.on_cleanup()
 
 

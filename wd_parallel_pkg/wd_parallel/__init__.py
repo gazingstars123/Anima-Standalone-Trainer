@@ -66,6 +66,7 @@ from .apply import (
     RowParallelSpec,
     apply_parallelism,
     sync_replicated_grads,
+    set_wgrad_gather_reuse,
 )
 from .fsdp import wrap_fsdp
 
@@ -92,7 +93,7 @@ __all__ = [
     "trim_padded_features", "trim_packed_padded_features",
     # Apply
     "ParallelSpec", "ColumnParallelSpec", "PackedColumnParallelSpec", "RowParallelSpec",
-    "apply_parallelism", "sync_replicated_grads",
+    "apply_parallelism", "sync_replicated_grads", "set_wgrad_gather_reuse",
     # FSDP
     "wrap_fsdp",
 ]
