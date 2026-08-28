@@ -41,6 +41,10 @@ from torch.optim import Optimizer
 from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 import transformers
+
+#for transformer 5.x
+if not hasattr(transformers.utils, "FLAX_WEIGHTS_NAME"):
+    transformers.utils.FLAX_WEIGHTS_NAME = "flax_model.msgpack"
 from diffusers.optimization import (
     SchedulerType as DiffusersSchedulerType,
     TYPE_TO_SCHEDULER_FUNCTION as DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION,
