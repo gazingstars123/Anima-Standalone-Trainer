@@ -5347,6 +5347,15 @@ def get_optimizer(args, trainable_params) -> tuple[str, str, object]:
         optimizer_class = torch.optim.AdamW
         optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
+    elif optimizer_type == "CAME".lower():
+        try:
+            import pytorch_optimizer
+        except ImportError:
+            raise ImportError("No pytorch_optimizer / pytorch-optimizerがインストールされていないようです")
+        logger.info(f"use CAME optimizer | {optimizer_kwargs}")
+        optimizer_class = pytorch_optimizer.CAME
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
     elif optimizer_type.endswith("schedulefree".lower()):
         try:
             import schedulefree as sf
